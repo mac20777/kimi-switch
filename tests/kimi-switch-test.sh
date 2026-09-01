@@ -47,6 +47,11 @@ esac
 EOF
 chmod +x "$mock_bin/python3"
 
+PATH="$mock_bin:$PATH" KIMI_CODE_HOME="$kimi_home" "$repo_root/kimi-switch" help | \
+    grep -q '5 小时额度用尽时'
+PATH="$mock_bin:$PATH" KIMI_CODE_HOME="$kimi_home" "$repo_root/kimi-switch" help | \
+    grep -q '返回退出码 3'
+
 PATH="$mock_bin:$PATH" KIMI_CODE_HOME="$kimi_home" "$repo_root/kimi-switch" rotate >/dev/null
 cmp -s "$kimi_home/credentials/kimi-code.json" "$kimi_home/accounts/B.credentials.json"
 [[ "$(<"$kimi_home/accounts/.current")" == "B" ]]

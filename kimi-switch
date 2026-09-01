@@ -866,6 +866,16 @@ kimi-switch — 一键切换 Kimi Code CLI 账号
   kimi-switch statusline   状态栏输出（配置在 tui.toml 的 status_line.command）
   kimi-switch help         显示本帮助
 
+【5 小时额度用尽时】
+  1. 至少先保存两个账号：kimi-switch save <名字>
+  2. 查看所有账号额度：kimi-switch usage
+  3. 当前账号额度用尽后：kimi-switch rotate
+
+  rotate 会排除当前账号和无可用额度的账号，切到剩余额度最多的账号。
+  它不会启动新会话或修改模型/思考档位；运行中的 Kimi 下一次请求即生效。
+  没有可用备用账号时保持当前账号不变，并返回退出码 3。
+  自动化程序应仅在 QUOTA_EXCEEDED_ERR 或 QuotaExceededError 后调用 rotate。
+
 【注意】
   · 切换对运行中的 kimi 会话即时生效（CLI 每次请求都重读凭证文件），无需重启
   · 状态栏用量来自本地缓存，由 usage / go 命令刷新
