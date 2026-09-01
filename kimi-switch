@@ -39,32 +39,32 @@ write_api_key() {
 # 判断某个快照是否为当前登录态（比内容，不打印任何密钥）
 is_current() {
     local name="$1"
-    local snap="$PROFILES/$name.credentials.json"
+    local snap="$PROFILES/${name}.credentials.json"
     [ -f "$snap" ] && [ -f "$CRED" ] && cmp -s "$snap" "$CRED"
 }
 
 cmd_save() {
     local name="$1"
     [ -f "$CRED" ] || { echo "错误：还没登录过 Kimi Code，先运行 kimi 并 /login"; exit 1; }
-    cp "$CRED" "$PROFILES/$name.credentials.json"
-    chmod 600 "$PROFILES/$name.credentials.json"
-    current_api_key > "$PROFILES/$name.apikey"
-    chmod 600 "$PROFILES/$name.apikey"
-    echo "已保存账号「$name」"
+    cp "$CRED" "$PROFILES/${name}.credentials.json"
+    chmod 600 "$PROFILES/${name}.credentials.json"
+    current_api_key > "$PROFILES/${name}.apikey"
+    chmod 600 "$PROFILES/${name}.apikey"
+    echo "已保存账号「${name}」"
 }
 
 cmd_use() {
     local name="$1"
-    local snap="$PROFILES/$name.credentials.json"
-    [ -f "$snap" ] || { echo "错误：没有账号「$name」，先 kimi-switch save $name"; exit 1; }
-    if is_current "$name"; then
-        echo "当前已经是「$name」，无需切换"
+    local snap="$PROFILES/${name}.credentials.json"
+    [ -f "$snap" ] || { echo "错误：没有账号「${name}」，先 kimi-switch save ${name}"; exit 1; }
+    if is_current "${name}"; then
+        echo "当前已经是「${name}」，无需切换"
         return
     fi
     cp "$snap" "$CRED"
     chmod 600 "$CRED"
-    [ -f "$PROFILES/$name.apikey" ] && write_api_key "$(cat "$PROFILES/$name.apikey")"
-    echo "已切换到「$name」"
+    [ -f "$PROFILES/${name}.apikey" ] && write_api_key "$(cat "$PROFILES/${name}.apikey")"
+    echo "已切换到「${name}」"
     echo "注意：正在运行的 Kimi Code 会话不会热切换，重开一个新会话生效"
 }
 
@@ -75,10 +75,10 @@ cmd_ls() {
         found=1
         local name
         name=$(basename "$f" .credentials.json)
-        if is_current "$name"; then
-            echo "* $name（当前）"
+        if is_current "${name}"; then
+            echo "* ${name}（当前）"
         else
-            echo "  $name"
+            echo "  ${name}"
         fi
     done
     [ "$found" -eq 1 ] || echo "（还没有保存任何账号，先 /login 后 kimi-switch save <名字>）"
@@ -89,8 +89,8 @@ cmd_current() {
         [ -e "$f" ] || continue
         local name
         name=$(basename "$f" .credentials.json)
-        if is_current "$name"; then
-            echo "$name"
+        if is_current "${name}"; then
+            echo "${name}"
             return
         fi
     done
@@ -99,8 +99,8 @@ cmd_current() {
 
 cmd_rm() {
     local name="$1"
-    rm -f "$PROFILES/$name.credentials.json" "$PROFILES/$name.apikey"
-    echo "已删除账号「$name」"
+    rm -f "$PROFILES/${name}.credentials.json" "$PROFILES/${name}.apikey"
+    echo "已删除账号「${name}」"
 }
 
 cmd_auto() {
@@ -133,7 +133,7 @@ cmd_auto() {
         local i=1
         for n in "${names[@]}"; do
             if is_current "$n"; then
-                echo "  $i) $n（当前）"
+                echo "  $i) ${n}（当前）"
             else
                 echo "  $i) $n"
             fi
