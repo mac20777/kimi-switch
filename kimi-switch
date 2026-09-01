@@ -131,6 +131,121 @@ cmd_rm() {
     echo "已删除账号「${name}」"
 }
 
+# 查询所有账号的用量：5 小时滚动窗口、每周额度、加油包余额。
+# access_token 过期时自动用 refresh_token 刷新（并写回快照，防止刷新令牌轮转过期的）
+cmd_usage() {
+    python3 - "$PROFILES" "$CRED" <<'PYEOF'
+import glob, json, os, sys, time
+import urllib.request, urllib.parse
+
+profiles_dir, live_cred_path = sys.argv[1], sys.argv[2]
+CLIENT_ID = '17e5f671-d194-4dfb-9706-5516cb48c098'
+TOKEN_URL = 'https://auth.kimi.com/api/oauth/token'
+USAGE_URL = 'https://api.kimi.com/coding/v1/usages'
+
+live = None
+if os.path.exists(live_cred_path):
+    live = open(live_cred_path, 'rb').read()
+
+def load(path):
+    with open(path) as f:
+        return json.load(f)
+
+def save(path, data):
+    with open(path, 'w') as f:
+        json.dump(data, f)
+    os.chmod(path, 0o600)
+
+def refresh(cred):
+    body = urllib.parse.urlencode({
+        'client_id': CLIENT_ID,
+        'refresh_token': cred['refresh_token'],
+        'grant_type': 'refresh_token',
+    }).encode()
+    req = urllib.request.Request(TOKEN_URL, data=body)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        resp = json.load(r)
+    cred.update({k: resp[k] for k in ('access_token', 'refresh_token', 'expires_in', 'scope', 'token_type') if k in resp})
+    cred['expires_at'] = int(time.time()) + int(resp.get('expires_in', 900))
+    return cred
+
+def fmt_reset(iso):
+    if not iso:
+        return ''
+    from datetime import datetime, timezone
+    t = datetime.fromisoformat(iso.replace('Z', '+00:00')).astimezone()
+    now = datetime.now().astimezone()
+    if t.date() == now.date():
+        return t.strftime('%H:%M')
+    return t.strftime('%m-%d %H:%M')
+
+def used_of(d):
+    if not d:
+        return None, None
+    limit = d.get('limit')
+    used = d.get('used')
+    if used is None and d.get('remaining') is not None and limit is not None:
+        used = int(limit) - int(d['remaining'])
+    return (int(used) if used is not None else 0), (int(limit) if limit is not None else None)
+
+files = sorted(glob.glob(os.path.join(profiles_dir, '*.credentials.json')))
+if not files:
+    print('还没有保存任何账号')
+    sys.exit(0)
+
+for path in files:
+    name = os.path.basename(path)[:-len('.credentials.json')]
+    current = live is not None and open(path, 'rb').read() == live
+    title = '账号 %s%s' % (name, '（当前）' if current else '')
+    print(title)
+    try:
+        cred = load(path)
+        if cred.get('expires_at', 0) < time.time() + 60:
+            cred = refresh(cred)
+            save(path, cred)
+            if current:
+                save(live_cred_path, cred)
+        req = urllib.request.Request(USAGE_URL, headers={'Authorization': 'Bearer ' + cred['access_token']})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        print('  查询失败（HTTP %s）%s' % (e.code, '，登录态已失效，请 /login 后重新 save' if e.code == 401 else ''))
+        continue
+    except Exception as e:
+        print('  查询失败：%s' % e)
+        continue
+
+    level = (data.get('user') or {}).get('membership', {}).get('level', '')
+    if level:
+        print('  会员等级：%s' % level.replace('LEVEL_', ''))
+
+    weekly, wlimit = used_of(data.get('usage'))
+    if wlimit is not None:
+        print('  每周额度：%s/%s，%s 重置' % (weekly, wlimit, fmt_reset((data.get('usage') or {}).get('resetTime'))))
+
+    for row in data.get('limits') or []:
+        win = row.get('window') or {}
+        dur, unit = win.get('duration'), win.get('timeUnit', '')
+        label = '%s%s窗口' % (dur, {'TIME_UNIT_MINUTE': '分钟', 'TIME_UNIT_HOUR': '小时', 'TIME_UNIT_DAY': '天', 'TIME_UNIT_WEEK': '周'}.get(unit, unit))
+        if unit == 'TIME_UNIT_MINUTE' and dur and dur % 60 == 0:
+            label = '%s小时窗口' % (dur // 60)
+        used, limit = used_of(row.get('detail'))
+        print('  %s：%s/%s，%s 重置' % (label, used, limit, fmt_reset((row.get('detail') or {}).get('resetTime'))))
+
+    wallet = data.get('boosterWallet')
+    if wallet:
+        monthly = wallet.get('monthlyUsed') or {}
+        cents = int(monthly.get('priceInCents') or 0)
+        status = wallet.get('status', '')
+        extra = '加油包：本月已用 ¥%.2f' % (cents / 100)
+        if status == 'STATUS_DISABLED':
+            extra += '（未开启）'
+        print('  %s' % extra)
+    print()
+PYEOF
+}
+
+
 cmd_auto() {
     local names=()
     for f in "$PROFILES"/*.credentials.json; do
@@ -193,6 +308,7 @@ kimi-switch — 一键切换 Kimi Code CLI 账号
   kimi-switch use <名字>   切换到指定账号
   kimi-switch save <名字>  把当前登录态存为账号快照
   kimi-switch rm <名字>    删除某个账号快照
+  kimi-switch usage        查看所有账号的用量（5小时窗口 / 每周额度 / 加油包）
   kimi-switch help         显示本帮助
 
 【注意】
@@ -211,6 +327,7 @@ case "${1:-}" in
     ls)      cmd_ls ;;
     current) cmd_current ;;
     rm)      [ -n "${2:-}" ] || { echo "用法: kimi-switch rm <名字>"; exit 1; }; cmd_rm "$2" ;;
+    usage|status) cmd_usage ;;
     "")      cmd_auto ;;
     *)       echo "未知命令「$1」。可用：save / use / ls / current / rm，或不带参数一键切换"; exit 1 ;;
 esac

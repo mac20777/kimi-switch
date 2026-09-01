@@ -32,6 +32,7 @@ chmod +x ~/.local/bin/kimi-switch
 | `kimi-switch use <名字>` | 切换到指定账号 |
 | `kimi-switch save <名字>` | 把当前登录态存为快照 |
 | `kimi-switch rm <名字>` | 删除快照 |
+| `kimi-switch usage` | 查看所有账号的用量（5 小时滚动窗口 / 每周额度 / 加油包），access token 过期会自动刷新 |
 | `kimi-switch help` | 查看帮助 |
 
 ## 注意
