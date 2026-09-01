@@ -13,6 +13,10 @@
 - [x] 状态栏集成：tui.toml status_line.command 显示当前账号和余量（读本地缓存，不走网络）
 - [x] token 自动刷新并写回快照（防止 refresh token 轮转失效）
 - [x] 切换后提示 `kimi --session <id>` 恢复当前目录上次的对话
+- [x] 热切换：核实 CLI 每次请求都重读凭证文件，切换对运行中的会话即时生效；原子写入（tmp+rename）防止被读到半截文件
+- [x] 快照自愈：`synclive` 把 CLI 运行时轮转过的最新凭证回同步到快照（`use`/`usage`/`go` 入口自动执行）
+- [x] 切换前置校验 `freshen`：refresh token 已死的快照拒绝装入 live（失效凭证会被 CLI 刷新失败后写成空 token 墓碑）
+- [x] 状态栏预渲染：`statusline` 变成纯 cat 本地文件，杜绝 300ms 超时回退内置布局造成的闪烁
 
 ## 第二档：防翻车
 

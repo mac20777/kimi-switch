@@ -3,6 +3,8 @@
 #
 # 原理：Kimi Code 的登录态保存在 ~/.kimi-code/credentials/kimi-code.json，
 # config.toml 里还有一行 api_key。本工具把这两样按账号名做快照、来回换。
+# CLI 每次 API 请求都重读凭证文件（0.39 源码核实），所以换掉 live 文件后
+# 运行中的会话下一次请求即生效——切换是热切换，无需重启会话。
 #
 # 用法：
 #   kimi-switch               只有两个账号时直接互换；否则弹出编号菜单
@@ -65,6 +67,8 @@ is_current() {
 mark_current() {
     printf '%s' "$1" > "$CURRENT_FILE"
     chmod 600 "$CURRENT_FILE"
+    # 账号变了，预渲染的状态栏文本同步刷新（静默，失败无碍）
+    ks_py statusline "$PROFILES" "$CRED" "$CACHE" >/dev/null 2>&1 || true
 }
 
 # ---------- python 后端（网络请求都在这里） ----------
@@ -184,7 +188,91 @@ def update_cache(name, entry):
         cache[name] = entry
         save_json(cache_path, cache)
 
-if cmd == 'saveinfo':
+def sync_live():
+    """CLI 每次请求都重读 live 凭证，刷新后会把轮转的新凭证写回 live，但快照不更新，
+    放着不管快照最终会因 refresh_token 被轮转而失效（invalid_grant）。
+    这里把 live 回同步到 .current 标记账号的快照（use/usage/best 入口都会调用）。
+    已知边界：若绕开本工具直接 /login 成别的账号，.current 启发式会把凭证存错快照——
+    但不同步则快照必死，两害相权取同步。"""
+    try:
+        name = open(os.path.join(profiles_dir, '.current')).read().strip()
+    except Exception:
+        return
+    if not name:
+        return
+    snap_path = os.path.join(profiles_dir, name + '.credentials.json')
+    if not (os.path.exists(snap_path) and os.path.exists(live_cred_path)):
+        return
+    try:
+        live_raw = open(live_cred_path, 'rb').read()
+        if live_raw == open(snap_path, 'rb').read():
+            return
+        if os.path.getmtime(live_cred_path) <= os.path.getmtime(snap_path):
+            return
+        live_cred = json.loads(live_raw)
+    except Exception:
+        return
+    if not live_cred.get('access_token'):  # 空 token 墓碑不回同步
+        return
+    save_json(snap_path, live_cred)
+    print('已将运行中刷新的凭证回同步到「%s」快照' % name)
+
+def statusline_text():
+    # 只读本地缓存，绝不发网络请求（状态栏有 300ms 预算，超时会回退内置布局造成闪烁）
+    name = ''
+    try:
+        name = open(os.path.join(profiles_dir, '.current')).read().strip()
+    except Exception:
+        pass
+    cache = {}
+    try:
+        cache = load(cache_path)
+    except Exception:
+        pass
+    entry = cache.get(name) if name else None
+    ident = read_identity(name) if name else {}
+    label = name or '?'
+    if ident.get('nickname'):
+        label = '%s(%s)' % (label, ident['nickname'])
+    if not entry:
+        return '%s · 用量未知，跑一次 kimi-switch usage' % label
+    parts = [label]
+    if 'week_limit' in entry:
+        parts.append('周剩%s/%s' % (entry['week_limit'] - entry['week_used'], entry['week_limit']))
+    if 'h5_limit' in entry:
+        parts.append('5h剩%s/%s' % (entry['h5_limit'] - entry['h5_used'], entry['h5_limit']))
+    return ' · '.join(parts)
+
+def write_statusline_file(text):
+    # 预渲染到 .statusline.txt：statusline 命令直接 cat，不启动 python
+    try:
+        with open(os.path.join(profiles_dir, '.statusline.txt'), 'w') as f:
+            f.write(text + '\n')
+    except Exception:
+        pass
+
+if cmd == 'synclive':
+    # argv: synclive <profiles_dir> <live_cred>
+    sync_live()
+
+elif cmd == 'freshen':
+    # argv: freshen <profiles_dir> <snapshot_path>
+    # use 的前置校验：token 剩余有效期低于 CLI 刷新阈值（max(300, expires_in/2)，加 30s 余量）就先刷新。
+    # 退出码：0=可用；3=refresh_token 已死（HTTP 400/401），调用方应中止切换；1=其他错误
+    snap_path = sys.argv[3]
+    try:
+        cred = load(snap_path)
+        threshold = max(300, cred.get('expires_in', 900) * 0.5) + 30
+        if cred.get('expires_at', 0) - time.time() < threshold:
+            cred = refresh(cred)
+            save_json(snap_path, cred)
+        sys.exit(0)
+    except urllib.error.HTTPError as e:
+        sys.exit(3 if e.code in (400, 401) else 1)
+    except Exception:
+        sys.exit(1)
+
+elif cmd == 'saveinfo':
     # argv: saveinfo <profiles_dir> <cred_snapshot> <live_cred>
     snap_path, live_path = sys.argv[3], sys.argv[4]
     name = profile_name(snap_path)
@@ -209,6 +297,7 @@ if cmd == 'saveinfo':
 
 elif cmd == 'usage':
     live = open(live_cred_path, 'rb').read() if os.path.exists(live_cred_path) else None
+    sync_live()
     files = profiles()
     if not files:
         print('还没有保存任何账号')
@@ -224,7 +313,7 @@ elif cmd == 'usage':
             if current and cred != load(live_cred_path):
                 save_json(live_cred_path, cred)
         except urllib.error.HTTPError as e:
-            print('  查询失败（HTTP %s）%s' % (e.code, '，登录态已失效，请 /login 后重新 save' if e.code == 401 else ''))
+            print('  查询失败（HTTP %s）%s' % (e.code, '，登录态已失效，请 /login 后重新 save' if e.code in (400, 401) else ''))
             continue
         except Exception as e:
             print('  查询失败：%s' % e)
@@ -252,9 +341,11 @@ elif cmd == 'usage':
                 extra += '（未开启）'
             print('  %s' % extra)
         print()
+    write_statusline_file(statusline_text())
 
 elif cmd == 'best':
     # 选出余量最多的账号：5 小时窗口剩余优先，每周剩余做平手裁决
+    sync_live()
     best_name, best_key = None, None
     for path in profiles():
         name = profile_name(path)
@@ -274,6 +365,7 @@ elif cmd == 'best':
         key = (h5_rem, w_rem)
         if best_key is None or key > best_key:
             best_name, best_key = name, key
+    write_statusline_file(statusline_text())
     print(best_name or '')
 
 elif cmd == 'dirs':
@@ -375,32 +467,9 @@ elif cmd == 'applyprefs':
     print('已套用偏好：%s' % '，'.join('%s=%s' % (k, v) for k, v in prefs.items() if v))
 
 elif cmd == 'statusline':
-    # 只读本地缓存，绝不发网络请求（状态栏 300ms 预算）
-    name = ''
-    current_file = os.path.join(profiles_dir, '.current')
-    try:
-        name = open(current_file).read().strip()
-    except Exception:
-        pass
-    cache = {}
-    try:
-        cache = load(cache_path)
-    except Exception:
-        pass
-    entry = cache.get(name) if name else None
-    ident = read_identity(name) if name else {}
-    label = name or '?'
-    if ident.get('nickname'):
-        label = '%s(%s)' % (label, ident['nickname'])
-    if not entry:
-        print('%s · 用量未知，跑一次 kimi-switch usage' % label)
-    else:
-        parts = [label]
-        if 'week_limit' in entry:
-            parts.append('周剩%s/%s' % (entry['week_limit'] - entry['week_used'], entry['week_limit']))
-        if 'h5_limit' in entry:
-            parts.append('5h剩%s/%s' % (entry['h5_limit'] - entry['h5_used'], entry['h5_limit']))
-        print(' · '.join(parts))
+    text = statusline_text()
+    write_statusline_file(text)
+    print(text)
 
 else:
     print('未知子命令 %s' % cmd, file=sys.stderr)
@@ -425,17 +494,30 @@ cmd_use() {
     local name="$1"
     local snap="$PROFILES/${name}.credentials.json"
     [ -f "$snap" ] || { echo "错误：没有账号「${name}」，先 kimi-switch save ${name}"; exit 1; }
+    # 先把 live 里（可能被 CLI 刷新轮转过的）最新凭证回同步到当前账号的快照
+    ks_py synclive "$PROFILES" "$CRED" 2>/dev/null || true
     if is_current "${name}"; then
         echo "当前已经是「${name}」，无需切换"
         mark_current "${name}"
         return
     fi
-    cp "$snap" "$CRED"
-    chmod 600 "$CRED"
+    # 前置校验：换入的快照必须能刷新（refresh_token 有效）。
+    # 失效凭证装进 live 的话，CLI 刷新失败会把它写成空 token 墓碑，必须拦在这里。
+    local rc=0
+    ks_py freshen "$PROFILES" "$snap" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 3 ]; then
+        echo "错误：「${name}」的快照已失效（refresh_token 已被轮转），请 /login 后重新 save"
+        exit 1
+    elif [ "$rc" -ne 0 ]; then
+        echo "警告：快照校验失败（网络问题？），按原样切换"
+    fi
+    # 原子安装：CLI 每次请求都重读这个文件，非原子写可能被读到半截 JSON
+    local tmp="$CRED.tmp.$$"
+    cp "$snap" "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$CRED"
     [ -f "$PROFILES/${name}.apikey" ] && write_api_key "$(cat "$PROFILES/${name}.apikey")"
     mark_current "${name}"
     echo "已切换到「${name}」"
-    echo "注意：正在运行的 Kimi Code 会话不会热切换（凭证只在启动时读一次）"
+    echo "运行中的 kimi 会话下一次请求就会自动用上新账号，无需重启"
     resume_hint
 }
 
@@ -708,16 +790,17 @@ kimi-switch — 一键切换 Kimi Code CLI 账号
   kimi-switch dir <编号>   只打印项目路径（配合 cd "$(ks dir 2)" 使用）
   kimi-switch prefs        查看/修改启动偏好（prefs model|permission|effort 值）
   kimi-switch usage        查看所有账号的用量（5小时窗口 / 每周额度 / 加油包）
+  kimi-switch synclive     把 live 里 CLI 刷新过的最新凭证回同步到当前账号快照（usage/use 已自动做）
   kimi-switch ls           列出所有账号（含昵称），* 号 = 当前生效
   kimi-switch current      只显示当前账号名
-  kimi-switch use <名字>   切换到指定账号
+  kimi-switch use <名字>   切换到指定账号（热切，运行中的会话下一次请求即生效）
   kimi-switch save <名字>  把当前登录态存为账号快照
   kimi-switch rm <名字>    删除某个账号快照
   kimi-switch statusline   状态栏输出（配置在 tui.toml 的 status_line.command）
   kimi-switch help         显示本帮助
 
 【注意】
-  · 切换后正在运行的 kimi 会话不会变，重开一个新会话才是新账号
+  · 切换对运行中的 kimi 会话即时生效（CLI 每次请求都重读凭证文件），无需重启
   · 状态栏用量来自本地缓存，由 usage / go 命令刷新
   · 快照存在 ~/.kimi-code/accounts/（权限 600），不会打印密钥
 EOF
@@ -734,8 +817,9 @@ case "${1:-}" in
     ls)      cmd_ls ;;
     current) cmd_current ;;
     rm)      [ -n "${2:-}" ] || { echo "用法: kimi-switch rm <名字>"; exit 1; }; cmd_rm "$2" ;;
+    synclive)  ks_py synclive "$PROFILES" "$CRED" ;;
     usage|status) cmd_usage ;;
-    statusline) ks_py statusline "$PROFILES" "$CRED" "$CACHE" ;;
+    statusline) cat "$PROFILES/.statusline.txt" 2>/dev/null || ks_py statusline "$PROFILES" "$CRED" "$CACHE" ;;
     "")      cmd_auto ;;
-    *)       echo "未知命令「$1」。可用：save / use / go / prefs / usage / ls / current / rm / statusline，或不带参数一键切换"; exit 1 ;;
+    *)       echo "未知命令「$1」。可用：save / use / go / prefs / usage / synclive / ls / current / rm / statusline，或不带参数一键切换"; exit 1 ;;
 esac
