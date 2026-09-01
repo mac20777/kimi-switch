@@ -10,6 +10,7 @@
 #   kimi-switch               只有两个账号时直接互换；否则弹出编号菜单
 #   kimi-switch save <名字>   把当前登录态存为账号快照（先 /login 再 save）
 #   kimi-switch use <名字>    切换到指定账号
+#   kimi-switch rotate       无交互切到有额度的最佳其他账号
 #   kimi-switch go            自动切到余量最多的账号并启动 kimi
 #   kimi-switch usage         查看所有账号的用量
 #   kimi-switch ls            列出所有账号，* 号表示当前生效的
@@ -177,6 +178,38 @@ def cache_entry(data):
             entry['h5_used'], entry['h5_limit'] = u, l
             entry['h5_reset'] = (row.get('detail') or {}).get('resetTime', '')
     return entry
+
+def remaining_key(data):
+    """返回 (5 小时剩余, 每周剩余)；未知值为 -1。"""
+    w_used, w_limit = used_of(data.get('usage'))
+    w_rem = (w_limit - w_used) if w_limit is not None else -1
+    h5_rem = -1
+    for row in data.get('limits') or []:
+        win = row.get('window') or {}
+        if win.get('timeUnit') == 'TIME_UNIT_MINUTE' and win.get('duration') == 300:
+            used, limit = used_of(row.get('detail'))
+            h5_rem = (limit - used) if limit is not None else -1
+            break
+    return h5_rem, w_rem
+
+def current_profile_name():
+    try:
+        marked = open(os.path.join(profiles_dir, '.current')).read().strip()
+        if marked and os.path.exists(os.path.join(profiles_dir, marked + '.credentials.json')):
+            return marked
+    except Exception:
+        pass
+    try:
+        live = open(live_cred_path, 'rb').read()
+    except Exception:
+        return ''
+    for path in profiles():
+        try:
+            if open(path, 'rb').read() == live:
+                return profile_name(path)
+        except Exception:
+            continue
+    return ''
 
 def update_cache(name, entry):
     cache = {}
@@ -354,15 +387,31 @@ elif cmd == 'best':
         except Exception:
             continue
         update_cache(name, cache_entry(data))
-        w_used, w_limit = used_of(data.get('usage'))
-        w_rem = (w_limit - w_used) if w_limit is not None else -1
-        h5_rem = -1
-        for row in data.get('limits') or []:
-            win = row.get('window') or {}
-            if win.get('timeUnit') == 'TIME_UNIT_MINUTE' and win.get('duration') == 300:
-                u, l = used_of(row.get('detail'))
-                h5_rem = l - u if l is not None else -1
-        key = (h5_rem, w_rem)
+        key = remaining_key(data)
+        if best_key is None or key > best_key:
+            best_name, best_key = name, key
+    write_statusline_file(statusline_text())
+    print(best_name or '')
+
+elif cmd == 'best-other':
+    # 给自动化调用：排除当前账号，只返回 5 小时和每周额度仍可用的最佳账号。
+    sync_live()
+    current_name = current_profile_name()
+    best_name, best_key = None, None
+    for path in profiles():
+        name = profile_name(path)
+        if name == current_name:
+            continue
+        try:
+            _, data = query_account(path)
+        except Exception:
+            continue
+        entry = cache_entry(data)
+        update_cache(name, entry)
+        key = remaining_key(data)
+        h5_rem, week_rem = key
+        if h5_rem <= 0 or week_rem == 0:
+            continue
         if best_key is None or key > best_key:
             best_name, best_key = name, key
     write_statusline_file(statusline_text())
@@ -728,6 +777,23 @@ cmd_usage() {
     ks_py usage "$PROFILES" "$CRED" "$CACHE"
 }
 
+# 无交互切到有可用额度的最佳其他账号，不启动 kimi、不套用偏好。
+# 退出码 3 表示没有可切换的可用账号，适合监督脚本安全调用。
+cmd_rotate() {
+    local best="" rc=0
+    best=$(ks_py best-other "$PROFILES" "$CRED" "$CACHE" 2>/dev/null) || rc=$?
+    best=$(printf '%s\n' "$best" | tail -1)
+    if [ "$rc" -ne 0 ]; then
+        echo "错误：无法查询其他账号额度" >&2
+        return 3
+    fi
+    if [ -z "$best" ]; then
+        echo "没有其他仍有可用额度的账号" >&2
+        return 3
+    fi
+    cmd_use "$best"
+}
+
 cmd_auto() {
     local names=()
     for f in "$PROFILES"/*.credentials.json; do
@@ -790,6 +856,7 @@ kimi-switch — 一键切换 Kimi Code CLI 账号
   kimi-switch dir <编号>   只打印项目路径（配合 cd "$(ks dir 2)" 使用）
   kimi-switch prefs        查看/修改启动偏好（prefs model|permission|effort 值）
   kimi-switch usage        查看所有账号的用量（5小时窗口 / 每周额度 / 加油包）
+  kimi-switch rotate       无交互切到有额度的最佳其他账号，不启动 kimi
   kimi-switch synclive     把 live 里 CLI 刷新过的最新凭证回同步到当前账号快照（usage/use 已自动做）
   kimi-switch ls           列出所有账号（含昵称），* 号 = 当前生效
   kimi-switch current      只显示当前账号名
@@ -814,6 +881,7 @@ case "${1:-}" in
     dirs)    cmd_dirs ;;
     dir)     cmd_dir "${2:-last}" ;;
     prefs)   shift; cmd_prefs "$@" ;;
+    rotate)  cmd_rotate ;;
     ls)      cmd_ls ;;
     current) cmd_current ;;
     rm)      [ -n "${2:-}" ] || { echo "用法: kimi-switch rm <名字>"; exit 1; }; cmd_rm "$2" ;;
@@ -821,5 +889,5 @@ case "${1:-}" in
     usage|status) cmd_usage ;;
     statusline) cat "$PROFILES/.statusline.txt" 2>/dev/null || ks_py statusline "$PROFILES" "$CRED" "$CACHE" ;;
     "")      cmd_auto ;;
-    *)       echo "未知命令「$1」。可用：save / use / go / prefs / usage / synclive / ls / current / rm / statusline，或不带参数一键切换"; exit 1 ;;
+    *)       echo "未知命令「$1」。可用：save / use / rotate / go / prefs / usage / synclive / ls / current / rm / statusline，或不带参数一键切换"; exit 1 ;;
 esac
