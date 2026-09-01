@@ -24,6 +24,7 @@ PROFILES="$KIMI_HOME/accounts"
 CACHE="$PROFILES/.usage-cache.json"
 CURRENT_FILE="$PROFILES/.current"
 PREFS="$PROFILES/prefs.conf"
+DIRS="$PROFILES/.dirs"
 mkdir -p "$PROFILES"
 chmod 700 "$PROFILES"
 
@@ -275,6 +276,59 @@ elif cmd == 'best':
             best_name, best_key = name, key
     print(best_name or '')
 
+elif cmd == 'dirs':
+    # argv: dirs <dirs_file> <session_index> <cwd>
+    # 每个最近项目附带它最近一次会话的标题和时间（会话历史是按项目目录存的）
+    dirs_file, index_path, cwd = sys.argv[2], sys.argv[3], sys.argv[4]
+    dirs = []
+    if os.path.exists(dirs_file):
+        dirs = [l.strip() for l in open(dirs_file) if l.strip()]
+    if not dirs:
+        sys.exit(0)
+    last = {}
+    if os.path.exists(index_path):
+        for line in open(index_path):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get('workDir'):
+                last[rec['workDir']] = rec
+    for i, d in enumerate(dirs, 1):
+        mark = '（当前位置）' if d == cwd else ('' if os.path.isdir(d) else '（已删除）')
+        print('%2d) %s%s' % (i, d, mark))
+        rec = last.get(d)
+        if rec:
+            title, when = '', ''
+            try:
+                st = load(os.path.join(rec['sessionDir'], 'state.json'))
+                title = st.get('title', '')
+                ts = int(st.get('updatedAt') or 0) / 1000
+                when = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M') if ts else ''
+            except Exception:
+                pass
+            print('     上次会话：%s%s' % (title or '(无标题)', ' · ' + when if when else ''))
+
+elif cmd == 'lastsession':
+    # argv: lastsession <session_index> <workdir> —— 打印该目录最近一次会话的 id
+    index_path, workdir = sys.argv[2], sys.argv[3]
+    sid = ''
+    if os.path.exists(index_path):
+        for line in open(index_path):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get('workDir') == workdir and rec.get('sessionId'):
+                sid = rec['sessionId']
+    print(sid)
+
 elif cmd == 'applyprefs':
     # argv: applyprefs <config_path> <prefs_file>
     # 把偏好写进 config.toml：default_model / default_permission_mode / [thinking].effort
@@ -385,8 +439,52 @@ cmd_use() {
     resume_hint
 }
 
+# 记录当前目录到最近项目列表（去重、最多 20 条、最新在最前）
+record_dir() {
+    local dir="$1"
+    [ "$dir" = "$HOME" ] && return   # 主目录不算项目
+    touch "$DIRS"
+    chmod 600 "$DIRS"
+    local tmp="$DIRS.tmp.$$"
+    { echo "$dir"; grep -vxF "$dir" "$DIRS" 2>/dev/null || true; } | head -20 > "$tmp"
+    mv "$tmp" "$DIRS"
+}
+
+# 取最近项目列表第 N 条（1 起）
+dir_at() {
+    sed -n "${1}p" "$DIRS" 2>/dev/null
+}
+
 # 自动选余量最多的账号，套用偏好设置，然后启动 kimi
+# 用法：ks go               在当前目录启动新会话（并记录目录）
+#       ks go last          跳回上一个项目，接着上次的对话继续聊
+#       ks go <编号>        跳到 ks dirs 里的第 N 个项目，接着上次的对话继续聊
+#       ks go last new      跳回去但开新会话
 cmd_go() {
+    local jumped=0
+    if [ "${1:-}" = "last" ] || [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+        local target=""
+        if [ "$1" = "last" ]; then
+            local i=1
+            while :; do
+                local d
+                d=$(dir_at "$i")
+                [ -z "$d" ] && break
+                if [ "$d" != "$PWD" ]; then target="$d"; break; fi
+                i=$((i + 1))
+            done
+            [ -n "$target" ] || { echo "错误：还没有最近项目记录，先在项目目录里跑一次 ks go"; exit 1; }
+        else
+            target=$(dir_at "$1")
+            [ -n "$target" ] || { echo "错误：最近项目列表里没有第 $1 条（ks dirs 查看）"; exit 1; }
+        fi
+        [ -d "$target" ] || { echo "错误：目录已不存在：$target"; exit 1; }
+        echo "跳回项目：$target"
+        cd "$target"
+        jumped=1
+        shift
+    fi
+
     local best
     best=$(ks_py best "$PROFILES" "$CRED" "$CACHE" 2>/dev/null | tail -1)
     if [ -n "$best" ] && ! is_current "$best"; then
@@ -398,7 +496,56 @@ cmd_go() {
         echo "用量查询失败，保持当前账号" >&2
     fi
     ks_py applyprefs "$CONFIG" "$PREFS" 2>/dev/null || true
+    record_dir "$PWD"
+
+    # 跳回项目时，默认接着该项目上次的会话继续（对话历史是按项目目录存的）
+    local want_new=0
+    if [ "$jumped" -eq 1 ] && [ "${1:-}" = "new" ]; then
+        want_new=1
+        shift
+    fi
+    if [ "$jumped" -eq 1 ] && [ "$want_new" -eq 0 ]; then
+        local sid
+        sid=$(ks_py lastsession "$KIMI_HOME/session_index.jsonl" "$PWD" 2>/dev/null | tail -1)
+        if [ -n "$sid" ]; then
+            echo "恢复上次会话：$sid"
+            exec kimi --session "$sid" "$@"
+        else
+            echo "这个项目还没有会话记录，开新会话"
+        fi
+    fi
     exec kimi "$@"
+}
+
+# 列出最近项目目录（含各项目上次的会话标题）
+cmd_dirs() {
+    if [ ! -s "$DIRS" ]; then
+        echo "（还没有记录。ks go 启动时会自动记下当前项目目录）"
+        return
+    fi
+    ks_py dirs "$DIRS" "$KIMI_HOME/session_index.jsonl" "$PWD"
+    echo
+    echo "跳回去接着聊：ks go <编号>    只跳回不启动：cd \"\$(ks dir <编号>)\""
+}
+
+# 只打印目录路径（供 cd "$(ks dir last)" 用）
+cmd_dir() {
+    local n="${1:-last}"
+    if [ "$n" = "last" ]; then
+        local i=1 d=""
+        while :; do
+            d=$(dir_at "$i")
+            [ -z "$d" ] && break
+            [ "$d" != "$PWD" ] && break
+            i=$((i + 1)); d=""
+        done
+        [ -n "$d" ] && [ -d "$d" ] && { echo "$d"; return; }
+        echo "错误：没有可用的最近项目" >&2; exit 1
+    fi
+    local d
+    d=$(dir_at "$n")
+    [ -n "$d" ] && [ -d "$d" ] && { echo "$d"; return; }
+    echo "错误：没有第 $n 条记录或目录已删除" >&2; exit 1
 }
 
 # 查看 / 修改启动偏好（go 启动前自动套用到 config.toml）
@@ -555,7 +702,10 @@ kimi-switch — 一键切换 Kimi Code CLI 账号
 
 【日常使用】
   kimi-switch              一键互换（只存了两个账号时最常用）
-  kimi-switch go           自动选号 + 套用偏好（YOLO/K3/max）并启动 kimi（推荐）
+  kimi-switch go           自动选号 + 套用偏好并启动 kimi（当前目录开新会话）
+  kimi-switch go <编号>    跳回最近项目并接着上次的对话聊（last = 上一个项目）
+  kimi-switch dirs         最近项目列表，附各项目上次的会话标题和时间
+  kimi-switch dir <编号>   只打印项目路径（配合 cd "$(ks dir 2)" 使用）
   kimi-switch prefs        查看/修改启动偏好（prefs model|permission|effort 值）
   kimi-switch usage        查看所有账号的用量（5小时窗口 / 每周额度 / 加油包）
   kimi-switch ls           列出所有账号（含昵称），* 号 = 当前生效
@@ -578,6 +728,8 @@ case "${1:-}" in
     save)    [ -n "${2:-}" ] || { echo "用法: kimi-switch save <名字>"; exit 1; }; cmd_save "$2" ;;
     use)     [ -n "${2:-}" ] || { echo "用法: kimi-switch use <名字>"; exit 1; }; cmd_use "$2" ;;
     go)      shift; cmd_go "$@" ;;
+    dirs)    cmd_dirs ;;
+    dir)     cmd_dir "${2:-last}" ;;
     prefs)   shift; cmd_prefs "$@" ;;
     ls)      cmd_ls ;;
     current) cmd_current ;;
