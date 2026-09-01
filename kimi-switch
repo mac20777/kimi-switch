@@ -65,7 +65,35 @@ cmd_use() {
     chmod 600 "$CRED"
     [ -f "$PROFILES/${name}.apikey" ] && write_api_key "$(cat "$PROFILES/${name}.apikey")"
     echo "已切换到「${name}」"
-    echo "注意：正在运行的 Kimi Code 会话不会热切换，重开一个新会话生效"
+    echo "注意：正在运行的 Kimi Code 会话不会热切换（凭证只在启动时读一次）"
+    resume_hint
+}
+
+# 找出当前目录最近一次的会话，提示如何恢复（聊天记录存在本地，不随账号变）
+resume_hint() {
+    local index="$KIMI_HOME/session_index.jsonl"
+    [ -f "$index" ] || return
+    local sid
+    sid=$(python3 -c "
+import json, sys, os
+cwd = os.getcwd()
+last = None
+for line in open('$index'):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if rec.get('workDir') == cwd and rec.get('sessionId'):
+        last = rec['sessionId']
+print(last or '')
+" 2>/dev/null)
+    if [ -n "$sid" ]; then
+        echo "在当前目录继续上次的对话，请运行："
+        echo "  kimi --session $sid"
+    fi
 }
 
 cmd_ls() {
