@@ -6,9 +6,10 @@
 
 ## 功能
 
-- **一键换号**：`kimi-switch` 在两个账号间互切（凭证文件 + api_key 快照替换）
-- **自动选号启动**：`kimi-switch go` 查询各账号余量，自动切到剩余最多的账号再启动 kimi
-- **用量总览**：`kimi-switch usage` 并排查看所有账号的 5 小时滚动窗口、每周额度、加油包
+- **一键换号**：`ks` 在两个账号间互切（凭证文件 + api_key 快照替换）
+- **自动选号启动**：`ks go` 查询各账号余量，自动切到剩余最多的账号再启动 kimi
+- **偏好保持**：每次 `ks go` 启动前自动套用偏好到 config.toml（默认 YOLO 模式 + K3 模型 + max 思考），解决 CLI 每次打开都要重选的问题；用 `ks prefs` 查看 / 修改
+- **用量总览**：`ks usage` 并排查看所有账号的 5 小时滚动窗口、每周额度、加油包
 - **账号身份**：save 时自动记录昵称和手机号，`ls` 里一眼分清谁是谁
 - **状态栏集成**：在 Kimi Code 底部常驻显示"当前账号 · 本周剩余 · 5h 剩余"
 - **token 自维护**：access token 过期自动用 refresh token 刷新并写回快照
@@ -18,30 +19,34 @@
 ```bash
 cp kimi-switch ~/.local/bin/kimi-switch
 chmod +x ~/.local/bin/kimi-switch
+ln -sf ~/.local/bin/kimi-switch ~/.local/bin/ks   # 缩写，以后敲 ks 即可
 ```
 
 确保 `~/.local/bin` 在 `PATH` 里。
 
 ## 首次设置（只做一次）
 
-1. 在 kimi 里 `/login` 登录账号 A，然后运行 `kimi-switch save A`
-2. 在 kimi 里 `/login` 换成账号 B，再运行 `kimi-switch save B`
-3. 以后敲 `kimi-switch` 互切，或用 `kimi-switch go` 代替 `kimi` 启动（自动选余量多的号）
+1. 在 kimi 里 `/login` 登录账号 A，然后运行 `ks save A`
+2. 在 kimi 里 `/login` 换成账号 B，再运行 `ks save B`
+3. 以后敲 `ks` 互切，或用 `ks go` 代替 `kimi` 启动（自动选号 + 套用偏好）
 
 ## 命令
 
 | 命令 | 作用 |
 | --- | --- |
-| `kimi-switch` | 一键互换（两个账号时）；多账号弹出编号菜单 |
-| `kimi-switch go` | 自动切到余量最多的账号并启动 kimi |
-| `kimi-switch usage` | 查看所有账号用量（5 小时窗口 / 每周额度 / 加油包） |
-| `kimi-switch ls` | 列出所有账号（含昵称），`*` = 当前生效 |
-| `kimi-switch current` | 显示当前账号名 |
-| `kimi-switch use <名字>` | 切换到指定账号 |
-| `kimi-switch save <名字>` | 把当前登录态存为快照 |
-| `kimi-switch rm <名字>` | 删除快照 |
-| `kimi-switch statusline` | 状态栏输出（见下文） |
-| `kimi-switch help` | 查看帮助 |
+| `ks` | 一键互换（两个账号时）；多账号弹出编号菜单 |
+| `ks go` | 自动选号 + 套用偏好并启动 kimi |
+| `ks prefs` | 查看偏好；`ks prefs model/permission/effort <值>` 修改 |
+| `ks usage` | 查看所有账号用量（5 小时窗口 / 每周额度 / 加油包） |
+| `ks ls` | 列出所有账号（含昵称），`*` = 当前生效 |
+| `ks current` | 显示当前账号名 |
+| `ks use <名字>` | 切换到指定账号 |
+| `ks save <名字>` | 把当前登录态存为快照 |
+| `ks rm <名字>` | 删除快照 |
+| `ks statusline` | 状态栏输出（见下文） |
+| `ks help` | 查看帮助 |
+
+（所有命令用全名 `kimi-switch` 也一样生效。）
 
 ## 状态栏
 

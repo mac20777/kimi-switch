@@ -23,8 +23,18 @@ CONFIG="$KIMI_HOME/config.toml"
 PROFILES="$KIMI_HOME/accounts"
 CACHE="$PROFILES/.usage-cache.json"
 CURRENT_FILE="$PROFILES/.current"
+PREFS="$PROFILES/prefs.conf"
 mkdir -p "$PROFILES"
 chmod 700 "$PROFILES"
+
+# 偏好文件：每次 go 启动前套用到 config.toml，解决 CLI 每次打开都要重选的问题
+if [ ! -f "$PREFS" ]; then
+    cat > "$PREFS" <<'EOF'
+model=kimi-code/k3
+permission=yolo
+effort=max
+EOF
+fi
 
 # ---------- bash 小工具 ----------
 
@@ -265,6 +275,51 @@ elif cmd == 'best':
             best_name, best_key = name, key
     print(best_name or '')
 
+elif cmd == 'applyprefs':
+    # argv: applyprefs <config_path> <prefs_file>
+    # 把偏好写进 config.toml：default_model / default_permission_mode / [thinking].effort
+    import re
+    config_path, prefs_file = sys.argv[2], sys.argv[3]
+    prefs = {}
+    for line in open(prefs_file):
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k, v = line.split('=', 1)
+            prefs[k.strip()] = v.strip()
+    with open(config_path) as f:
+        text = f.read()
+
+    def set_toplevel(text, key, value):
+        pat = re.compile(r'(?m)^%s = .*$' % re.escape(key))
+        line = '%s = "%s"' % (key, value)
+        if pat.search(text):
+            return pat.sub(line, text, count=1)
+        # 插入到第一个 [section] 之前（顶层区域）
+        m = re.search(r'(?m)^\[', text)
+        if m:
+            return text[:m.start()] + line + '\n\n' + text[m.start():]
+        return text.rstrip('\n') + '\n' + line + '\n'
+
+    if prefs.get('model'):
+        text = set_toplevel(text, 'default_model', prefs['model'])
+    if prefs.get('permission'):
+        text = set_toplevel(text, 'default_permission_mode', prefs['permission'])
+    if prefs.get('effort'):
+        # 只改 [thinking] 段里的 effort
+        m = re.search(r'(?ms)^\[thinking\]\n(.*?)(?=^\[|\Z)', text)
+        if m:
+            body = m.group(1)
+            if re.search(r'(?m)^effort = ', body):
+                body = re.sub(r'(?m)^effort = .*$', 'effort = "%s"' % prefs['effort'], body, count=1)
+            else:
+                body = body.rstrip('\n') + '\neffort = "%s"\n' % prefs['effort']
+            text = text[:m.start(1)] + body + text[m.end(1):]
+        else:
+            text = text.rstrip('\n') + '\n\n[thinking]\nenabled = true\neffort = "%s"\n' % prefs['effort']
+    with open(config_path, 'w') as f:
+        f.write(text)
+    print('已套用偏好：%s' % '，'.join('%s=%s' % (k, v) for k, v in prefs.items() if v))
+
 elif cmd == 'statusline':
     # 只读本地缓存，绝不发网络请求（状态栏 300ms 预算）
     name = ''
@@ -330,7 +385,7 @@ cmd_use() {
     resume_hint
 }
 
-# 自动选余量最多的账号，然后启动 kimi
+# 自动选余量最多的账号，套用偏好设置，然后启动 kimi
 cmd_go() {
     local best
     best=$(ks_py best "$PROFILES" "$CRED" "$CACHE" 2>/dev/null | tail -1)
@@ -342,7 +397,34 @@ cmd_go() {
     else
         echo "用量查询失败，保持当前账号" >&2
     fi
+    ks_py applyprefs "$CONFIG" "$PREFS" 2>/dev/null || true
     exec kimi "$@"
+}
+
+# 查看 / 修改启动偏好（go 启动前自动套用到 config.toml）
+cmd_prefs() {
+    if [ $# -eq 0 ]; then
+        echo "当前偏好（每次 kimi-switch go 启动前套用）："
+        cat "$PREFS"
+        echo
+        echo "修改示例：kimi-switch prefs model kimi-code/k3"
+        echo "          kimi-switch prefs permission yolo|auto|manual"
+        echo "          kimi-switch prefs effort low|high|max"
+        return
+    fi
+    local key="$1" value="${2:-}"
+    case "$key" in
+        model|permission|effort) ;;
+        *) echo "未知偏好项「${key}」，可选：model / permission / effort"; exit 1 ;;
+    esac
+    [ -n "$value" ] || { echo "用法: kimi-switch prefs ${key} <值>"; exit 1; }
+    if grep -q "^${key}=" "$PREFS"; then
+        sed -i '' "s|^${key}=.*|${key}=${value}|" "$PREFS"
+    else
+        echo "${key}=${value}" >> "$PREFS"
+    fi
+    echo "已设置 ${key}=${value}"
+    ks_py applyprefs "$CONFIG" "$PREFS" 2>/dev/null || true
 }
 
 # 找出当前目录最近一次的会话，提示如何恢复（聊天记录存在本地，不随账号变）
@@ -473,7 +555,8 @@ kimi-switch — 一键切换 Kimi Code CLI 账号
 
 【日常使用】
   kimi-switch              一键互换（只存了两个账号时最常用）
-  kimi-switch go           自动切到余量最多的账号并启动 kimi（推荐代替 kimi 用）
+  kimi-switch go           自动选号 + 套用偏好（YOLO/K3/max）并启动 kimi（推荐）
+  kimi-switch prefs        查看/修改启动偏好（prefs model|permission|effort 值）
   kimi-switch usage        查看所有账号的用量（5小时窗口 / 每周额度 / 加油包）
   kimi-switch ls           列出所有账号（含昵称），* 号 = 当前生效
   kimi-switch current      只显示当前账号名
@@ -495,11 +578,12 @@ case "${1:-}" in
     save)    [ -n "${2:-}" ] || { echo "用法: kimi-switch save <名字>"; exit 1; }; cmd_save "$2" ;;
     use)     [ -n "${2:-}" ] || { echo "用法: kimi-switch use <名字>"; exit 1; }; cmd_use "$2" ;;
     go)      shift; cmd_go "$@" ;;
+    prefs)   shift; cmd_prefs "$@" ;;
     ls)      cmd_ls ;;
     current) cmd_current ;;
     rm)      [ -n "${2:-}" ] || { echo "用法: kimi-switch rm <名字>"; exit 1; }; cmd_rm "$2" ;;
     usage|status) cmd_usage ;;
     statusline) ks_py statusline "$PROFILES" "$CRED" "$CACHE" ;;
     "")      cmd_auto ;;
-    *)       echo "未知命令「$1」。可用：save / use / go / usage / ls / current / rm / statusline，或不带参数一键切换"; exit 1 ;;
+    *)       echo "未知命令「$1」。可用：save / use / go / prefs / usage / ls / current / rm / statusline，或不带参数一键切换"; exit 1 ;;
 esac

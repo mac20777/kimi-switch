@@ -4,9 +4,10 @@
 
 ## 已实现
 
-- [x] 账号快照保存 / 一键互换（凭证 + api_key）
-- [x] 用量总览：5 小时滚动窗口、每周额度、加油包（`kimi-switch usage`）
-- [x] 启动时自动选号：`kimi-switch go` 切到余量最多的账号再启动 kimi
+- [x] 账号快照保存 / 一键互换（凭证 + api_key），缩写命令 `ks`
+- [x] 用量总览：5 小时滚动窗口、每周额度、加油包（`ks usage`）
+- [x] 启动时自动选号：`ks go` 切到余量最多的账号再启动 kimi
+- [x] 偏好保持：`ks go` 启动前自动套用默认模型 / 权限模式 / 思考强度到 config.toml（`ks prefs` 管理）
 - [x] 账号身份：save 时记录昵称 / 手机号，`ls` 里直接显示
 - [x] 状态栏集成：tui.toml status_line.command 显示当前账号和余量（读本地缓存，不走网络）
 - [x] token 自动刷新并写回快照（防止 refresh token 轮转失效）
