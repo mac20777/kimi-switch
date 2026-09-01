@@ -1,0 +1,188 @@
+#!/bin/bash
+# kimi-switch — 一键切换 Kimi Code CLI 账号
+#
+# 原理：Kimi Code 的登录态保存在 ~/.kimi-code/credentials/kimi-code.json，
+# config.toml 里还有一行 api_key。本工具把这两样按账号名做快照、来回换。
+#
+# 用法：
+#   kimi-switch save <名字>   把当前登录态存为账号快照（先 /login 再 save）
+#   kimi-switch use <名字>    切换到指定账号
+#   kimi-switch               只有两个账号时直接互换；否则弹出编号菜单
+#   kimi-switch ls            列出所有账号，* 号表示当前生效的
+#   kimi-switch current       显示当前是哪个账号
+#   kimi-switch rm <名字>     删除一个账号快照
+
+set -euo pipefail
+
+KIMI_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
+CRED="$KIMI_HOME/credentials/kimi-code.json"
+CONFIG="$KIMI_HOME/config.toml"
+PROFILES="$KIMI_HOME/accounts"
+mkdir -p "$PROFILES"
+chmod 700 "$PROFILES"
+
+# 从 config.toml 提取当前 api_key（可能为空）
+current_api_key() {
+    sed -n 's/^[[:space:]]*api_key = "\(.*\)"[[:space:]]*$/\1/p' "$CONFIG" 2>/dev/null | head -1
+}
+
+# 把 api_key 写回 config.toml（替换现有行；没有则在 provider 段后补一行）
+write_api_key() {
+    local key="$1"
+    local escaped
+    escaped=$(printf '%s' "$key" | sed 's/[&|\\]/\\&/g')
+    if grep -q '^[[:space:]]*api_key = ' "$CONFIG"; then
+        sed -i '' "s|^[[:space:]]*api_key = \".*\"|api_key = \"$escaped\"|" "$CONFIG"
+    fi
+}
+
+# 判断某个快照是否为当前登录态（比内容，不打印任何密钥）
+is_current() {
+    local name="$1"
+    local snap="$PROFILES/$name.credentials.json"
+    [ -f "$snap" ] && [ -f "$CRED" ] && cmp -s "$snap" "$CRED"
+}
+
+cmd_save() {
+    local name="$1"
+    [ -f "$CRED" ] || { echo "错误：还没登录过 Kimi Code，先运行 kimi 并 /login"; exit 1; }
+    cp "$CRED" "$PROFILES/$name.credentials.json"
+    chmod 600 "$PROFILES/$name.credentials.json"
+    current_api_key > "$PROFILES/$name.apikey"
+    chmod 600 "$PROFILES/$name.apikey"
+    echo "已保存账号「$name」"
+}
+
+cmd_use() {
+    local name="$1"
+    local snap="$PROFILES/$name.credentials.json"
+    [ -f "$snap" ] || { echo "错误：没有账号「$name」，先 kimi-switch save $name"; exit 1; }
+    if is_current "$name"; then
+        echo "当前已经是「$name」，无需切换"
+        return
+    fi
+    cp "$snap" "$CRED"
+    chmod 600 "$CRED"
+    [ -f "$PROFILES/$name.apikey" ] && write_api_key "$(cat "$PROFILES/$name.apikey")"
+    echo "已切换到「$name」"
+    echo "注意：正在运行的 Kimi Code 会话不会热切换，重开一个新会话生效"
+}
+
+cmd_ls() {
+    local found=0
+    for f in "$PROFILES"/*.credentials.json; do
+        [ -e "$f" ] || continue
+        found=1
+        local name
+        name=$(basename "$f" .credentials.json)
+        if is_current "$name"; then
+            echo "* $name（当前）"
+        else
+            echo "  $name"
+        fi
+    done
+    [ "$found" -eq 1 ] || echo "（还没有保存任何账号，先 /login 后 kimi-switch save <名字>）"
+}
+
+cmd_current() {
+    for f in "$PROFILES"/*.credentials.json; do
+        [ -e "$f" ] || continue
+        local name
+        name=$(basename "$f" .credentials.json)
+        if is_current "$name"; then
+            echo "$name"
+            return
+        fi
+    done
+    echo "（当前登录态不匹配任何已保存的账号）"
+}
+
+cmd_rm() {
+    local name="$1"
+    rm -f "$PROFILES/$name.credentials.json" "$PROFILES/$name.apikey"
+    echo "已删除账号「$name」"
+}
+
+cmd_auto() {
+    local names=()
+    for f in "$PROFILES"/*.credentials.json; do
+        [ -e "$f" ] || continue
+        names+=("$(basename "$f" .credentials.json)")
+    done
+    if [ "${#names[@]}" -eq 0 ]; then
+        echo "还没有保存任何账号。用法："
+        echo "  1. kimi 里 /login 登录账号 A，然后 kimi-switch save A"
+        echo "  2. kimi 里 /login 换登录账号 B，然后 kimi-switch save B"
+        echo "  3. 以后直接 kimi-switch 即可一键互换"
+        exit 0
+    elif [ "${#names[@]}" -eq 1 ]; then
+        echo "只保存了一个账号「${names[0]}」，再 save 一个才能切换"
+        exit 0
+    elif [ "${#names[@]}" -eq 2 ]; then
+        local other=""
+        for n in "${names[@]}"; do
+            is_current "$n" || other="$n"
+        done
+        if [ -z "$other" ]; then
+            # 当前登录态谁都不匹配，切到第一个
+            other="${names[0]}"
+        fi
+        cmd_use "$other"
+    else
+        echo "选择要切换的账号："
+        local i=1
+        for n in "${names[@]}"; do
+            if is_current "$n"; then
+                echo "  $i) $n（当前）"
+            else
+                echo "  $i) $n"
+            fi
+            i=$((i + 1))
+        done
+        printf "输入编号: "
+        read -r pick
+        case "$pick" in
+            ''|*[!0-9]*) echo "已取消"; exit 1 ;;
+        esac
+        [ "$pick" -ge 1 ] && [ "$pick" -le "${#names[@]}" ] || { echo "无效编号"; exit 1; }
+        cmd_use "${names[$((pick - 1))]}"
+    fi
+}
+
+cmd_help() {
+    cat <<'EOF'
+kimi-switch — 一键切换 Kimi Code CLI 账号
+
+【首次设置（只做一次）】
+  1. 在 kimi 里 /login 登录账号 A，然后运行:  kimi-switch save A
+  2. 在 kimi 里 /login 换成账号 B，再运行:    kimi-switch save B
+  （名字随便起，中文也行，比如 kimi-switch save 主号）
+
+【日常使用】
+  kimi-switch              一键互换（只存了两个账号时最常用）
+  kimi-switch ls           列出所有账号，* 号 = 当前生效
+  kimi-switch current      只显示当前账号名
+  kimi-switch use <名字>   切换到指定账号
+  kimi-switch save <名字>  把当前登录态存为账号快照
+  kimi-switch rm <名字>    删除某个账号快照
+  kimi-switch help         显示本帮助
+
+【注意】
+  · 切换后正在运行的 kimi 会话不会变，重开一个新会话才是新账号
+  · 验证切没切成功：新会话里运行 /usage 看额度归属
+  · 快照存在 ~/.kimi-code/accounts/（权限 600），不会打印密钥
+  · 原理：替换 ~/.kimi-code/credentials/kimi-code.json 和
+    config.toml 里的 api_key 行
+EOF
+}
+
+case "${1:-}" in
+    help|-h|--help) cmd_help ;;
+    save)    [ -n "${2:-}" ] || { echo "用法: kimi-switch save <名字>"; exit 1; }; cmd_save "$2" ;;
+    use)     [ -n "${2:-}" ] || { echo "用法: kimi-switch use <名字>"; exit 1; }; cmd_use "$2" ;;
+    ls)      cmd_ls ;;
+    current) cmd_current ;;
+    rm)      [ -n "${2:-}" ] || { echo "用法: kimi-switch rm <名字>"; exit 1; }; cmd_rm "$2" ;;
+    "")      cmd_auto ;;
+    *)       echo "未知命令「$1」。可用：save / use / ls / current / rm，或不带参数一键切换"; exit 1 ;;
+esac
