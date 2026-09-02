@@ -1,6 +1,6 @@
 # kimi-switch
 
-一键切换 [Kimi Code CLI](https://www.kimi.com/code/docs/en/) 账号的小工具（macOS / Linux，Bash + Python3，无第三方依赖）。
+一键切换 [Kimi Code CLI](https://www.kimi.com/code/docs/en/) 账号的小工具（macOS / Linux / Windows Git Bash，Bash + Python3，无第三方依赖）。
 
 适合同时持有多个 Kimi 会员账号、想在 CLI 里轮换使用额度的人。
 
@@ -27,6 +27,23 @@ ln -sf ~/.local/bin/kimi-switch ~/.local/bin/ks   # 缩写，以后敲 ks 即可
 
 确保 `~/.local/bin` 在 `PATH` 里。
 
+Windows 用户请在 **Git Bash** 中使用（脚本依赖 Bash），放到 PATH 里的任意目录即可。注意 Git Bash 默认不做真正的软链（`ln -s` 会变成复制文件，脚本更新后副本就过期了），所以 `ks` 直接用 `cp` 复制：
+
+```bash
+mkdir -p ~/bin && cp kimi-switch ~/bin/kimi-switch && cp kimi-switch ~/bin/ks
+# 若 ~/bin 不在 PATH：echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+```
+
+想在 **CMD / PowerShell** 里也能用，把仓库里的 `kimi-switch.cmd` 和 `kimi-switch` 一起复制到同一目录（包装脚本负责找到 Git Bash 并转发调用，退出码原样透传）：
+
+```cmd
+copy kimi-switch %USERPROFILE%\bin\kimi-switch
+copy kimi-switch.cmd %USERPROFILE%\bin\kimi-switch.cmd
+copy kimi-switch.cmd %USERPROFILE%\bin\ks.cmd
+```
+
+（中文输出在 GBK 控制台下可能显示乱码，执行 `chcp 65001` 切到 UTF-8 即可。）
+
 ## 首次设置（只做一次）
 
 1. 在 kimi 里 `/login` 登录账号 A，然后运行 `ks save A`
@@ -41,7 +58,7 @@ ln -sf ~/.local/bin/kimi-switch ~/.local/bin/ks   # 缩写，以后敲 ks 即可
 | `ks go` | 自动选号 + 套用偏好并启动 kimi（当前目录开新会话） |
 | `ks go <编号>` | 跳回最近项目并接着上次的对话聊（`ks go last` = 上一个项目；加 `new` 开新会话） |
 | `ks dirs` | 最近项目列表，附各项目上次的会话标题和时间 |
-| `ks dir <编号>` | 只打印项目路径，配合 `cd "$(ks dir 2)"` |
+| `ks dir <编号>` | 只打印项目路径，配合 `cd "$(ks dir 2)"`（PowerShell 用 `cd $(ks dir 2)`） |
 | `ks prefs` | 查看偏好；`ks prefs model/permission/effort <值>` 修改 |
 | `ks usage` | 查看所有账号用量（5 小时窗口 / 每周额度 / 加油包） |
 | `ks ls` | 列出所有账号（含昵称），`*` = 当前生效 |
@@ -100,6 +117,8 @@ fi
 [status_line]
 command = "/Users/<你>/.local/bin/kimi-switch statusline"
 ```
+
+（Windows 下换成实际安装路径，如 `C:/Users/<你>/bin/kimi-switch statusline`；若 CLI 无法直接执行无扩展名脚本，改成 `bash C:/Users/<你>/bin/kimi-switch statusline`。）
 
 效果：`B(用户5586) · 周剩100/100 · 5h剩100/100`。
 

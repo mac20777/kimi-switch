@@ -28,4 +28,4 @@
 
 - [ ] 支持 Kimi 开放平台（api.moonshot.cn 按量 key）及其它 AI CLI 的账号切换
 - [ ] 快照改存 macOS Keychain（目前是 0600 明文文件）
-- [ ] Linux 适配验证（目前只在 macOS 上测过）
+- [ ] Linux 适配验证（macOS 与 Windows Git Bash 已验证）

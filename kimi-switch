@@ -42,6 +42,44 @@ fi
 
 # ---------- bash 小工具 ----------
 
+# macOS 的 BSD sed 要写成 -i ''，GNU sed（Linux / Windows Git Bash）的 -i 不接受这个参数
+sed_i() {
+    if sed --version >/dev/null 2>&1; then
+        sed -i "$@"
+    else
+        sed -i '' "$@"
+    fi
+}
+
+# Windows 上常常没有 python3 命令（只有 python 或 py 启动器），
+# 微软商店占位的 python3.exe 也不能用，所以要真的跑一下验证
+PY=()
+for _pycand in python3 python; do
+    if command -v "$_pycand" >/dev/null 2>&1 && "$_pycand" -c '' >/dev/null 2>&1; then
+        PY=("$_pycand")
+        break
+    fi
+done
+if [ "${#PY[@]}" -eq 0 ] && command -v py >/dev/null 2>&1 && py -3 -c '' >/dev/null 2>&1; then
+    PY=(py -3)
+fi
+unset _pycand
+
+# Windows 原生 Python 的 stdio 和文本文件默认用系统 ANSI 码页（中文系统是 GBK），
+# 中文输出到 UTF-8 终端 / kimi 状态栏会变成乱码，写出的 .statusline.txt 也是 GBK。
+# 强制 UTF-8 模式；对 macOS / Linux 无害（那边本来就是 UTF-8）。
+export PYTHONUTF8=1
+
+# 嵌进 python 代码字符串里的路径：MSYS2 只转换独立的命令行参数，
+# 嵌在代码里的 /c/... 不会被转换，Windows 原生 Python 不认识，需用 cygpath 转成 C:/...
+py_path() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # 从 config.toml 提取当前 api_key（可能为空）
 current_api_key() {
     sed -n 's/^[[:space:]]*api_key = "\(.*\)"[[:space:]]*$/\1/p' "$CONFIG" 2>/dev/null | head -1
@@ -53,7 +91,7 @@ write_api_key() {
     local escaped
     escaped=$(printf '%s' "$key" | sed 's/[&|\\]/\\&/g')
     if grep -q '^[[:space:]]*api_key = ' "$CONFIG"; then
-        sed -i '' "s|^[[:space:]]*api_key = \".*\"|api_key = \"$escaped\"|" "$CONFIG"
+        sed_i "s|^[[:space:]]*api_key = \".*\"|api_key = \"$escaped\"|" "$CONFIG"
     fi
 }
 
@@ -75,7 +113,11 @@ mark_current() {
 # ---------- python 后端（网络请求都在这里） ----------
 
 ks_py() {
-    python3 - "$@" <<'PYEOF'
+    if [ "${#PY[@]}" -eq 0 ]; then
+        echo "错误：找不到可用的 Python 3 解释器（试过 python3 / python / py -3）" >&2
+        return 1
+    fi
+    "${PY[@]}" - "$@" <<'PYEOF'
 import glob, json, os, sys, time
 import urllib.request, urllib.parse
 from datetime import datetime
@@ -586,6 +628,15 @@ dir_at() {
     sed -n "${1}p" "$DIRS" 2>/dev/null
 }
 
+# 打印目录路径：经 ks.cmd 调用时（CMD/PowerShell）转成 Windows 形式，否则 PowerShell 的 cd 不认 /d/... 形式
+print_dir() {
+    if [ "${KS_VIA_CMD:-}" = "1" ] && command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
 # 自动选余量最多的账号，套用偏好设置，然后启动 kimi
 # 用法：ks go               在当前目录启动新会话（并记录目录）
 #       ks go last          跳回上一个项目，接着上次的对话继续聊
@@ -670,12 +721,12 @@ cmd_dir() {
             [ "$d" != "$PWD" ] && break
             i=$((i + 1)); d=""
         done
-        [ -n "$d" ] && [ -d "$d" ] && { echo "$d"; return; }
+        [ -n "$d" ] && [ -d "$d" ] && { print_dir "$d"; return; }
         echo "错误：没有可用的最近项目" >&2; exit 1
     fi
     local d
     d=$(dir_at "$n")
-    [ -n "$d" ] && [ -d "$d" ] && { echo "$d"; return; }
+    [ -n "$d" ] && [ -d "$d" ] && { print_dir "$d"; return; }
     echo "错误：没有第 $n 条记录或目录已删除" >&2; exit 1
 }
 
@@ -697,7 +748,7 @@ cmd_prefs() {
     esac
     [ -n "$value" ] || { echo "用法: kimi-switch prefs ${key} <值>"; exit 1; }
     if grep -q "^${key}=" "$PREFS"; then
-        sed -i '' "s|^${key}=.*|${key}=${value}|" "$PREFS"
+        sed_i "s|^${key}=.*|${key}=${value}|" "$PREFS"
     else
         echo "${key}=${value}" >> "$PREFS"
     fi
@@ -709,12 +760,13 @@ cmd_prefs() {
 resume_hint() {
     local index="$KIMI_HOME/session_index.jsonl"
     [ -f "$index" ] || return
+    [ "${#PY[@]}" -gt 0 ] || return
     local sid
-    sid=$(python3 -c "
+    sid=$("${PY[@]}" -c "
 import json, os
 cwd = os.getcwd()
 last = None
-for line in open('$index'):
+for line in open(r'$(py_path "$index")'):
     line = line.strip()
     if not line:
         continue
@@ -742,10 +794,10 @@ cmd_ls() {
         local mark=" "
         is_current "${name}" && mark="*"
         local ident=""
-        if [ -f "$PROFILES/${name}.info" ]; then
-            ident=$(python3 -c "
+        if [ -f "$PROFILES/${name}.info" ] && [ "${#PY[@]}" -gt 0 ]; then
+            ident=$("${PY[@]}" -c "
 import json
-d = json.load(open('$PROFILES/${name}.info'))
+d = json.load(open(r'$(py_path "$PROFILES/${name}.info")'))
 print(' · ' + ' '.join(x for x in [d.get('nickname',''), d.get('phone','')] if x))
 " 2>/dev/null)
         fi
