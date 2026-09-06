@@ -17,10 +17,11 @@
 - [x] 快照自愈：`synclive` 把 CLI 运行时轮转过的最新凭证回同步到快照（`use`/`usage`/`go` 入口自动执行）
 - [x] 切换前置校验 `freshen`：refresh token 已死的快照拒绝装入 live（失效凭证会被 CLI 刷新失败后写成空 token 墓碑）
 - [x] 状态栏预渲染：`statusline` 变成纯 cat 本地文件，杜绝 300ms 超时回退内置布局造成的闪烁
+- [x] 平衡策略选号：节奏盈余（周剩余占比 − 本周期剩余时间占比）决定"谁快重置且剩得多先用谁"，5h 门槛过滤 + 平手裁决 + 迟滞保持，`ks best -v` 查看评分明细（`best`/`go`/`rotate`/`watch` 共用）
+- [x] 5h 预判热切守护 `ks watch`：跌破阈值（或按消耗速率预测将跌破）就在用超之前自动热切 + macOS 通知；全员见底睡到最早恢复点；`--once` 配 launchd/cron
 
 ## 第二档：防翻车
 
-- [ ] 额度告警：定时检查，当前账号 5h 窗口用量超 80% 时弹系统通知（launchd/cron）
 - [ ] `kimi-switch doctor`：校验每个快照的 refresh token 是否有效、文件权限、config.toml 完整性
 - [ ] 用量历史：每次查询追加 CSV，观察消耗节奏、预测额度见底时间
 

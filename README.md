@@ -9,6 +9,8 @@
 - **一键换号·热切换**：`ks` 在两个账号间互切（凭证文件 + api_key 快照原子替换）；CLI 每次请求都重读凭证文件，**运行中的会话下一条消息即生效，无需重启**
 - **自动选号启动**：`ks go` 查询各账号余量，自动切到剩余最多的账号再启动 kimi
 - **自动化换号**：`ks rotate` 无交互切到仍有额度的最佳其他账号，不启动新会话、不改模型偏好
+- **平衡策略选号**：谁快重置且剩得多就先用谁（周剩余占比 − 本周期剩余时间占比 = 节奏盈余），不再只是"谁剩得多用谁"；`ks best -v` 查看各账号评分明细
+- **5h 预判热切**：`ks watch` 常驻守护，当前账号 5h 快用超**之前**自动热切换到最佳账号并弹系统通知；全员见底则睡到最早恢复点再查
 - **偏好保持**：每次 `ks go` 启动前自动套用偏好到 config.toml（默认 YOLO 模式 + K3 模型 + max 思考），解决 CLI 每次打开都要重选的问题；用 `ks prefs` 查看 / 修改
 - **项目目录记忆**：`ks go` 自动记录用过的项目目录；`ks dirs` 列出最近项目及各自上次的会话标题，`ks go <编号>` 跳回项目并接着上次的对话聊（会话历史按项目目录存放，找到项目 = 找到聊天记录）
 - **用量总览**：`ks usage` 并排查看所有账号的 5 小时滚动窗口、每周额度、加油包
@@ -59,12 +61,14 @@ copy kimi-switch.cmd %USERPROFILE%\bin\ks.cmd
 | `ks go <编号>` | 跳回最近项目并接着上次的对话聊（`ks go last` = 上一个项目；加 `new` 开新会话） |
 | `ks dirs` | 最近项目列表，附各项目上次的会话标题和时间 |
 | `ks dir <编号>` | 只打印项目路径，配合 `cd "$(ks dir 2)"`（PowerShell 用 `cd $(ks dir 2)`） |
-| `ks prefs` | 查看偏好；`ks prefs model/permission/effort <值>` 修改 |
+| `ks prefs` | 查看偏好；`ks prefs model/permission/effort <值>` 修改；`threshold`（5h 阈值%）和 `interval`（watch 间隔秒）调平衡策略 |
 | `ks usage` | 查看所有账号用量（5 小时窗口 / 每周额度 / 加油包） |
 | `ks ls` | 列出所有账号（含昵称），`*` = 当前生效 |
 | `ks current` | 显示当前账号名 |
 | `ks use <名字>` | 切换到指定账号（热切 + 前置校验） |
 | `ks rotate` | 无交互切到仍有额度的最佳其他账号；无可用账号时返回非零状态 |
+| `ks best [-v]` | 按平衡策略选出的账号（`-v` 看各账号评分明细和排除原因） |
+| `ks watch` | 5h 预判守护：快用超前自动热切；`--once` 单次检查（配 launchd/cron） |
 | `ks synclive` | 把 live 里 CLI 刷新过的最新凭证回同步到当前账号快照（`use`/`usage`/`go` 已自动做） |
 | `ks save <名字>` | 把当前登录态存为快照 |
 | `ks rm <名字>` | 删除快照 |
@@ -109,6 +113,48 @@ else
 fi
 ```
 
+## 自动平衡策略
+
+`ks best` / `ks go` / `ks rotate` / `ks watch` 共用同一套选号策略，优先级从高到低：
+
+1. **可用性硬门槛**：周剩余 > 0，且 5h 剩余 > 阈值（默认 10%，`ks prefs threshold` 可调）——不满足直接排除，避免切过去立刻撞墙。被动场景 `rotate`（当前已撞墙）放宽为 5h > 0。
+2. **周额度节奏盈余**（平衡主因子）：
+
+   ```
+   节奏盈余 = 周剩余额度占比 − 本周期剩余时间占比（按 7 天周期折算）
+   ```
+
+   盈余越大 = "照现在的节奏，重置前用不完这些额度" = 越要先用。也就是：**谁快重置且剩得多，先用谁**。例：A 明天重置、剩 60% → +0.46；B 六天后重置、剩 30% → −0.56 → 先用 A。新周期刚开始时大家剩余时间占比都接近 1，策略自然退化为"谁剩得多用谁"。
+3. **平手裁决**：盈余同档（差 < 5 个百分点）→ 比 5h 剩余（立即可用容量）→ 再比周剩余（总量均衡）。
+4. **稳定迟滞**：当前账号与最优者同档时保持不动，避免来回横跳。
+
+随时可以用 `ks best -v` 查看每个账号的 5h 剩余 / 周剩余 / 距重置 / 节奏盈余和排除原因。
+
+加油包是付费溢出额度，不参与自动选择；周额度烧完的账号直接排除。
+
+## 5h 预判热切（watch）
+
+`ks rotate` 是被动的（用超报错后切），`ks watch` 是主动的——**在用超之前切走**：
+
+```bash
+ks watch                  # 常驻：每 180s 查一次（ks prefs interval 可调）
+ks watch --once           # 单次检查，给 launchd/cron 用；无可切账号返回退出码 3
+ks watch --threshold 15   # 临时改阈值（默认 10%）
+```
+
+触发条件（满足其一）：当前账号 5h 剩余 ≤ 阈值；或按最近两次采样的消耗速率推算，下次检查前会跌破阈值；或周额度已用尽。触发后按上面的平衡策略选目标热切（候选必须自己也过阈值，不会跳进同样快见底的坑），并弹 macOS 系统通知。所有账号都不足时，睡到最早的 5h 恢复点再查并通知一次。
+
+用 launchd 常驻（`~/Library/LaunchAgents/com.user.kimi-switch-watch.plist`）：
+
+```xml
+<dict>
+  <key>Label</key><string>com.user.kimi-switch-watch</string>
+  <key>ProgramArguments</key>
+  <array><string>/Users/<你>/.local/bin/kimi-switch</string><string>watch</string><string>--once</string></array>
+  <key>StartInterval</key><integer>180</integer>
+</dict>
+```
+
 ## 状态栏
 
 在 `~/.kimi-code/tui.toml` 里加：
@@ -130,6 +176,7 @@ command = "/Users/<你>/.local/bin/kimi-switch statusline"
 - 聊天记录存在本地 `~/.kimi-code/sessions/`，不按账号区分，切换后不丢也不变；切换后会提示 `kimi --session <id>` 恢复当前目录上次的对话
 - 快照保存在 `~/.kimi-code/accounts/`（目录 700 / 文件 600），不会打印密钥
 - 如果设置了 `KIMI_CODE_HOME` 环境变量，工具会跟着走
+- 测试钩子：设置 `KS_USAGE_FIXTURES=<目录>` 后，用量查询改读 `<目录>/<账号>.usage.json` 且跳过 token 校验，全程不碰网络（`tests/` 用它离线验证平衡策略）
 
 ## License
 

@@ -11,6 +11,8 @@
 #   kimi-switch save <名字>   把当前登录态存为账号快照（先 /login 再 save）
 #   kimi-switch use <名字>    切换到指定账号
 #   kimi-switch rotate       无交互切到有额度的最佳其他账号
+#   kimi-switch best [-v]    按平衡策略选出的账号（-v 看各账号评分明细）
+#   kimi-switch watch        5h 预判守护：快用超前自动热切（--once 单次检查，给 launchd/cron）
 #   kimi-switch go            自动切到余量最多的账号并启动 kimi
 #   kimi-switch usage         查看所有账号的用量
 #   kimi-switch ls            列出所有账号，* 号表示当前生效的
@@ -80,6 +82,16 @@ py_path() {
     fi
 }
 
+# 从 prefs.conf 读数值型偏好（threshold/interval），缺省或非法时给默认值
+pref_val() {
+    local key="$1" default="$2" v
+    v=$(sed -n "s/^${key}=//p" "$PREFS" 2>/dev/null | head -1)
+    case "$v" in
+        ''|*[!0-9]*) echo "$default" ;;
+        *)           echo "$v" ;;
+    esac
+}
+
 # 从 config.toml 提取当前 api_key（可能为空）
 current_api_key() {
     sed -n 's/^[[:space:]]*api_key = "\(.*\)"[[:space:]]*$/\1/p' "$CONFIG" 2>/dev/null | head -1
@@ -127,6 +139,9 @@ TOKEN_URL = 'https://auth.kimi.com/api/oauth/token'
 BASE_URL = 'https://api.kimi.com/coding/v1'
 USAGE_URL = BASE_URL + '/usages'
 ME_URL = BASE_URL + '/me'
+WEEK_SECONDS = 7 * 86400
+# 测试缝：指向一个目录时，query_account 改读 <目录>/<账号>.usage.json，freshen 直接通过，全程不碰网络
+FIXTURES = os.environ.get('KS_USAGE_FIXTURES') or ''
 
 cmd = sys.argv[1]
 profiles_dir = sys.argv[2] if len(sys.argv) > 2 else ''
@@ -200,6 +215,11 @@ def read_identity(name):
 
 def query_account(path):
     """刷新（如需要）并查询用量。返回 (cred, usage_data)，抛异常表示失败。"""
+    if FIXTURES:
+        fx = os.path.join(FIXTURES, profile_name(path) + '.usage.json')
+        if not os.path.exists(fx):
+            raise Exception('缺少 fixture 文件：%s' % fx)
+        return load(path), load(fx)
     cred = load(path)
     fresh = ensure_fresh(cred)
     if fresh is not cred or fresh != load(path):
@@ -221,18 +241,95 @@ def cache_entry(data):
             entry['h5_reset'] = (row.get('detail') or {}).get('resetTime', '')
     return entry
 
-def remaining_key(data):
-    """返回 (5 小时剩余, 每周剩余)；未知值为 -1。"""
+def reset_ts(iso):
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso.replace('Z', '+00:00')).timestamp()
+    except Exception:
+        return None
+
+def quotas(data):
+    """提取 5h 窗口和周额度的 used/limit/reset_ts，未知为 None。"""
     w_used, w_limit = used_of(data.get('usage'))
-    w_rem = (w_limit - w_used) if w_limit is not None else -1
-    h5_rem = -1
+    q = {'h5_used': None, 'h5_limit': None, 'h5_reset': None,
+         'week_used': w_used, 'week_limit': w_limit,
+         'week_reset': reset_ts((data.get('usage') or {}).get('resetTime'))}
     for row in data.get('limits') or []:
         win = row.get('window') or {}
         if win.get('timeUnit') == 'TIME_UNIT_MINUTE' and win.get('duration') == 300:
-            used, limit = used_of(row.get('detail'))
-            h5_rem = (limit - used) if limit is not None else -1
+            q['h5_used'], q['h5_limit'] = used_of(row.get('detail'))
+            q['h5_reset'] = reset_ts((row.get('detail') or {}).get('resetTime'))
             break
-    return h5_rem, w_rem
+    return q
+
+def balance_key(data, now):
+    """平衡排序键：(surplus 档位, 5h剩余, 周剩余, surplus 原值)。大的优先。
+    surplus = 周剩余占比 − 本周期剩余时间占比：越大说明照当前节奏重置前用不完，越要先用
+    （“谁快重置且剩得多，先用谁”）。档位按 5 个百分点取整，同档由 5h 剩余裁决。"""
+    q = quotas(data)
+    h5_rem = (q['h5_limit'] - q['h5_used']) if q['h5_limit'] is not None else -1
+    w_rem = (q['week_limit'] - q['week_used']) if q['week_limit'] is not None else -1
+    surplus = 0.0
+    if q['week_limit'] and q['week_reset']:
+        time_frac = min(1.0, max(0.0, q['week_reset'] - now) / WEEK_SECONDS)
+        surplus = w_rem / q['week_limit'] - time_frac
+    bucket = int(round(surplus / 0.05))
+    return (bucket, h5_rem, w_rem, surplus)
+
+def rank_accounts(now, min_h5_pct, exclude=None):
+    """查询所有账号并按平衡策略排序。返回 (candidates, skipped, h5_resets)：
+    candidates 已过不可用的硬门槛（周剩余>0、5h 剩余>min_h5_pct%），按优先级降序；
+    skipped 是被排除的 [(name, key|None, quotas|None, 原因)]；
+    h5_resets 是所有查询成功账号的 5h 重置时间戳（watch 的 WAIT 用）。"""
+    cands, skipped, resets = [], [], []
+    for path in profiles():
+        name = profile_name(path)
+        if exclude and name == exclude:
+            continue
+        try:
+            _, data = query_account(path)
+        except Exception as e:
+            skipped.append((name, None, None, '查询失败：%s' % e))
+            continue
+        update_cache(name, cache_entry(data))
+        q = quotas(data)
+        if q['h5_reset']:
+            resets.append(q['h5_reset'])
+        key = balance_key(data, now)
+        h5_rem, w_rem = key[1], key[2]
+        if w_rem == 0:
+            skipped.append((name, key, q, '周额度已用尽'))
+            continue
+        if q['h5_limit'] is None:
+            skipped.append((name, key, q, '5h 数据缺失'))
+            continue
+        if h5_rem <= q['h5_limit'] * min_h5_pct / 100.0:
+            skipped.append((name, key, q, '5h 剩 %d/%d 低于 %d%% 门槛' % (h5_rem, q['h5_limit'], min_h5_pct)))
+            continue
+        cands.append((name, key, q, None))
+    cands.sort(key=lambda r: r[1], reverse=True)
+    return cands, skipped, resets
+
+def fmt_duration(secs):
+    secs = int(secs)
+    if secs <= 0:
+        return '即将重置'
+    d, r = divmod(secs, 86400)
+    h, m = r // 3600, (r % 3600) // 60
+    if d:
+        return '%d天%d小时' % (d, h)
+    return '%d小时%d分' % (h, m) if h else '%d分' % m
+
+def print_score_row(name, key, q, note, current, now):
+    label = name + ('（当前）' if name == current else '')
+    if key is None or q is None:
+        print('%-14s %-10s %-10s %-10s %-7s %s' % (label, '?', '?', '?', '?', note))
+        return
+    h5 = '%d/%d' % (key[1], q['h5_limit']) if q['h5_limit'] is not None else '?'
+    wk = '%d/%d' % (key[2], q['week_limit']) if q['week_limit'] is not None else '?'
+    rst = fmt_duration(q['week_reset'] - now) if q['week_reset'] else '?'
+    print('%-14s %-10s %-10s %-10s %-7s %s' % (label, h5, wk, rst, '%+.2f' % key[3], note))
 
 def current_profile_name():
     try:
@@ -334,6 +431,8 @@ elif cmd == 'freshen':
     # argv: freshen <profiles_dir> <snapshot_path>
     # use 的前置校验：token 剩余有效期低于 CLI 刷新阈值（max(300, expires_in/2)，加 30s 余量）就先刷新。
     # 退出码：0=可用；3=refresh_token 已死（HTTP 400/401），调用方应中止切换；1=其他错误
+    if FIXTURES:
+        sys.exit(0)
     snap_path = sys.argv[3]
     try:
         cred = load(snap_path)
@@ -419,45 +518,108 @@ elif cmd == 'usage':
     write_statusline_file(statusline_text())
 
 elif cmd == 'best':
-    # 选出余量最多的账号：5 小时窗口剩余优先，每周剩余做平手裁决
+    # argv: best <profiles_dir> <live_cred> <cache> [min_h5_pct] [--verbose]
+    # 平衡策略选号：硬门槛（周剩余>0、5h 剩余>min_h5_pct%）→ 节奏盈余档位 → 5h 剩余 → 周剩余。
+    # 迟滞：当前账号与第一名同档（surplus 差 <5pp）时保持不动。全部不过门槛时回退到余量最大者。
+    extra = sys.argv[5:]
+    verbose = '--verbose' in extra
+    nums = [a for a in extra if a != '--verbose']
+    min_h5_pct = float(nums[0]) if nums else 0.0
     sync_live()
-    best_name, best_key = None, None
-    for path in profiles():
-        name = profile_name(path)
-        try:
-            _, data = query_account(path)
-        except Exception:
-            continue
-        update_cache(name, cache_entry(data))
-        key = remaining_key(data)
-        if best_key is None or key > best_key:
-            best_name, best_key = name, key
+    now = time.time()
+    current = current_profile_name()
+    cands, skipped, _ = rank_accounts(now, min_h5_pct)
+    fallback = False
+    if not cands:
+        pool = [(n, k, q, None) for (n, k, q, _) in skipped if k is not None]
+        pool.sort(key=lambda r: r[1], reverse=True)
+        cands, fallback = pool[:1], True
+    chosen = cands[0][0] if cands else None
+    kept = False
+    if chosen and current and chosen != current and not fallback:
+        cur = next((r for r in cands if r[0] == current), None)
+        if cur is not None and cands[0][1][0] - cur[1][0] < 1:
+            chosen, kept = current, True
+    if verbose:
+        print('%-14s %-10s %-10s %-10s %-7s %s' % ('账号', '5h剩余', '周剩余', '距周重置', '节奏盈余', '说明'))
+        for n, k, q, _ in cands:
+            note = ''
+            if n == chosen:
+                note = '← 选用' + ('（与最优同档，保持当前）' if kept else '') + ('（全员未过门槛，回退取余量最大）' if fallback else '')
+            print_score_row(n, k, q, note, current, now)
+        for n, k, q, why in skipped:
+            if n != chosen:
+                print_score_row(n, k, q, why + '，排除', current, now)
     write_statusline_file(statusline_text())
-    print(best_name or '')
+    print(chosen or '')
 
 elif cmd == 'best-other':
-    # 给自动化调用：排除当前账号，只返回 5 小时和每周额度仍可用的最佳账号。
+    # argv: best-other <profiles_dir> <live_cred> <cache> [min_h5_pct]
+    # 给自动化调用：排除当前账号，按平衡策略选最佳。min_h5_pct 为 5h 门槛百分比：
+    # rotate 传 0（被动场景，有剩余即可），watch 传阈值（不切去同样快见底的账号）。
     sync_live()
-    current_name = current_profile_name()
-    best_name, best_key = None, None
-    for path in profiles():
-        name = profile_name(path)
-        if name == current_name:
-            continue
-        try:
-            _, data = query_account(path)
-        except Exception:
-            continue
-        entry = cache_entry(data)
-        update_cache(name, entry)
-        key = remaining_key(data)
-        h5_rem, week_rem = key
-        if h5_rem <= 0 or week_rem == 0:
-            continue
-        if best_key is None or key > best_key:
-            best_name, best_key = name, key
+    min_h5_pct = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0
+    cands, _, _ = rank_accounts(time.time(), min_h5_pct, exclude=current_profile_name())
     write_statusline_file(statusline_text())
-    print(best_name or '')
+    print(cands[0][0] if cands else '')
+
+elif cmd == 'watchcheck':
+    # argv: watchcheck <profiles_dir> <live_cred> <cache> [threshold_pct] [interval_sec]
+    # 5h 预判检查。单行输出动作：STAY <原因> / SWITCH <名字> <原因> / WAIT <秒数> <原因>。
+    # 平稳期只查当前账号（省请求），触发后才查其他账号选目标。
+    sync_live()
+    threshold = float(sys.argv[5]) if len(sys.argv) > 5 else 10.0
+    interval = int(sys.argv[6]) if len(sys.argv) > 6 else 180
+    now = time.time()
+    cur = current_profile_name()
+    if not cur:
+        print('STAY 未识别当前账号')
+        sys.exit(0)
+    try:
+        _, data = query_account(os.path.join(profiles_dir, cur + '.credentials.json'))
+    except Exception as e:
+        print('STAY 用量查询失败：%s' % e)
+        sys.exit(0)
+    update_cache(cur, cache_entry(data))
+    write_statusline_file(statusline_text())
+    q = quotas(data)
+    h5_rem = (q['h5_limit'] - q['h5_used']) if q['h5_limit'] is not None else -1
+    w_rem = (q['week_limit'] - q['week_used']) if q['week_limit'] is not None else -1
+    # 采样落盘，用相邻两次的差值推算消耗速率，预测下次检查前会不会跌破阈值
+    state_path = os.path.join(profiles_dir, '.watch-state.json')
+    try:
+        prev = load(state_path)
+    except Exception:
+        prev = None
+    save_json(state_path, {'name': cur, 'ts': int(now), 'h5_used': q['h5_used']})
+    projected = None
+    if prev and prev.get('name') == cur and q['h5_used'] is not None and prev.get('h5_used') is not None:
+        dt = now - prev['ts']
+        if dt > 0:
+            rate = (q['h5_used'] - prev['h5_used']) / dt
+            if rate > 0:
+                projected = h5_rem - rate * interval
+    reason = None
+    if w_rem == 0:
+        reason = '周额度已用尽'
+    elif q['h5_limit'] and h5_rem <= q['h5_limit'] * threshold / 100.0:
+        reason = '5h 剩 %d/%d，跌破 %d%% 阈值' % (h5_rem, q['h5_limit'], threshold)
+    elif projected is not None and q['h5_limit'] and projected <= q['h5_limit'] * threshold / 100.0:
+        reason = '按当前消耗速率，下次检查前 5h 将跌破 %d%% 阈值' % threshold
+    if not reason:
+        h5s = '%d/%d' % (h5_rem, q['h5_limit']) if q['h5_limit'] is not None else '未知'
+        ws = '%d/%d' % (w_rem, q['week_limit']) if q['week_limit'] is not None else '未知'
+        print('STAY 当前「%s」余量健康（5h剩%s · 周剩%s）' % (cur, h5s, ws))
+        sys.exit(0)
+    cands, _, resets = rank_accounts(now, threshold, exclude=cur)
+    if cands:
+        print('SWITCH %s %s' % (cands[0][0], reason))
+        sys.exit(0)
+    if q['h5_reset']:
+        resets.append(q['h5_reset'])
+    future = [r for r in resets if r > now]
+    wait = min(1800, int(min(future) - now) + 30) if future else 1800
+    print('WAIT %d %s；其他账号 5h 也都不足%s' % (wait, reason, '，睡到最早恢复点' if future else ''))
 
 elif cmd == 'dirs':
     # argv: dirs <dirs_file> <session_index> <cwd>
@@ -555,7 +717,8 @@ elif cmd == 'applyprefs':
             text = text.rstrip('\n') + '\n\n[thinking]\nenabled = true\neffort = "%s"\n' % prefs['effort']
     with open(config_path, 'w') as f:
         f.write(text)
-    print('已套用偏好：%s' % '，'.join('%s=%s' % (k, v) for k, v in prefs.items() if v))
+    applied = ['%s=%s' % (k, prefs[k]) for k in ('model', 'permission', 'effort') if prefs.get(k)]
+    print('已套用偏好：%s' % ('，'.join(applied) if applied else '（无可套用项）'))
 
 elif cmd == 'statusline':
     text = statusline_text()
@@ -609,7 +772,7 @@ cmd_use() {
     mark_current "${name}"
     echo "已切换到「${name}」"
     echo "运行中的 kimi 会话下一次请求就会自动用上新账号，无需重启"
-    resume_hint
+    [ -n "${KS_FROM_WATCH:-}" ] || resume_hint
 }
 
 # 记录当前目录到最近项目列表（去重、最多 20 条、最新在最前）
@@ -668,7 +831,7 @@ cmd_go() {
     fi
 
     local best
-    best=$(ks_py best "$PROFILES" "$CRED" "$CACHE" 2>/dev/null | tail -1)
+    best=$(ks_py best "$PROFILES" "$CRED" "$CACHE" "$(pref_val threshold 10)" 2>/dev/null | tail -1)
     if [ -n "$best" ] && ! is_current "$best"; then
         cmd_use "$best"
     elif [ -n "$best" ]; then
@@ -733,20 +896,30 @@ cmd_dir() {
 # 查看 / 修改启动偏好（go 启动前自动套用到 config.toml）
 cmd_prefs() {
     if [ $# -eq 0 ]; then
-        echo "当前偏好（每次 kimi-switch go 启动前套用）："
+        echo "当前偏好（model/permission/effort 在每次 go 启动前套用到 config.toml）："
         cat "$PREFS"
+        echo
+        echo "平衡策略参数：threshold=$(pref_val threshold 10)（5h 剩余百分比阈值），interval=$(pref_val interval 180)（watch 检查间隔秒）"
         echo
         echo "修改示例：kimi-switch prefs model kimi-code/k3"
         echo "          kimi-switch prefs permission yolo|auto|manual"
         echo "          kimi-switch prefs effort low|high|max"
+        echo "          kimi-switch prefs threshold 10"
+        echo "          kimi-switch prefs interval 180"
         return
     fi
     local key="$1" value="${2:-}"
     case "$key" in
-        model|permission|effort) ;;
-        *) echo "未知偏好项「${key}」，可选：model / permission / effort"; exit 1 ;;
+        model|permission|effort|threshold|interval) ;;
+        *) echo "未知偏好项「${key}」，可选：model / permission / effort / threshold / interval"; exit 1 ;;
     esac
     [ -n "$value" ] || { echo "用法: kimi-switch prefs ${key} <值>"; exit 1; }
+    case "$key" in
+        threshold|interval)
+            case "$value" in
+                ''|*[!0-9]*) echo "${key} 必须是数字"; exit 1 ;;
+            esac ;;
+    esac
     if grep -q "^${key}=" "$PREFS"; then
         sed_i "s|^${key}=.*|${key}=${value}|" "$PREFS"
     else
@@ -833,7 +1006,8 @@ cmd_usage() {
 # 退出码 3 表示没有可切换的可用账号，适合监督脚本安全调用。
 cmd_rotate() {
     local best="" rc=0
-    best=$(ks_py best-other "$PROFILES" "$CRED" "$CACHE" 2>/dev/null) || rc=$?
+    # 被动场景（当前已撞墙）：5h 门槛放宽为 >0，有剩就比没有强
+    best=$(ks_py best-other "$PROFILES" "$CRED" "$CACHE" 0 2>/dev/null) || rc=$?
     best=$(printf '%s\n' "$best" | tail -1)
     if [ "$rc" -ne 0 ]; then
         echo "错误：无法查询其他账号额度" >&2
@@ -844,6 +1018,80 @@ cmd_rotate() {
         return 3
     fi
     cmd_use "$best"
+}
+
+# 按平衡策略选出的账号；-v 显示各账号评分明细（为什么这么选）
+cmd_best() {
+    local verbose=""
+    [ "${1:-}" = "-v" ] && verbose="--verbose"
+    ks_py best "$PROFILES" "$CRED" "$CACHE" "$(pref_val threshold 10)" $verbose
+}
+
+# 系统通知（仅 macOS，best-effort；经环境变量传参，避免名字里的引号注进 AppleScript）
+watch_notify() {
+    [ "$(uname -s)" = "Darwin" ] || return 0
+    command -v osascript >/dev/null 2>&1 || return 0
+    KS_NTITLE="$1" KS_NBODY="$2" osascript -e \
+        'display notification (system attribute "KS_NBODY") with title (system attribute "KS_NTITLE")' \
+        >/dev/null 2>&1 || true
+}
+
+# 5h 预判守护：当前账号快用超前，按平衡策略自动热切走
+# 用法：kimi-switch watch [--once] [--interval 秒] [--threshold 百分比]
+cmd_watch() {
+    local once=0
+    local interval threshold
+    interval=$(pref_val interval 180)
+    threshold=$(pref_val threshold 10)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --once)      once=1 ;;
+            --interval)  shift; interval="${1:-}" ;;
+            --threshold) shift; threshold="${1:-}" ;;
+            *) echo "未知参数「$1」（可用：--once / --interval 秒 / --threshold 百分比）" >&2; return 1 ;;
+        esac
+        shift
+    done
+    case "$interval" in ''|*[!0-9]*) echo "interval 必须是正整数秒" >&2; return 1 ;; esac
+    case "$threshold" in ''|*[!0-9]*) echo "threshold 必须是 0-100 的数字" >&2; return 1 ;; esac
+    [ "$once" -eq 1 ] || echo "watch 已启动：每 ${interval}s 检查一次，5h 剩余 ≤${threshold}% 或预测用超前自动热切（Ctrl-C 停止）"
+    while :; do
+        local out action rest
+        out=$(ks_py watchcheck "$PROFILES" "$CRED" "$CACHE" "$threshold" "$interval" 2>/dev/null | tail -1 || true)
+        action=$(printf '%s' "$out" | cut -d' ' -f1)
+        rest=$(printf '%s' "$out" | cut -d' ' -f2-)
+        case "$action" in
+            STAY)
+                if [ "$once" -eq 1 ]; then echo "$rest"; return 0; fi
+                ;;
+            SWITCH)
+                local target why
+                target=$(printf '%s' "$rest" | cut -d' ' -f1)
+                why=$(printf '%s' "$rest" | cut -d' ' -f2-)
+                echo "[$(date '+%H:%M:%S')] 当前账号 ${why} → 热切换到「${target}」"
+                if KS_FROM_WATCH=1 cmd_use "$target"; then
+                    watch_notify "kimi-switch 自动换号" "已切到「${target}」（${why}）"
+                fi
+                [ "$once" -eq 1 ] && return 0
+                ;;
+            WAIT)
+                local secs why
+                secs=$(printf '%s' "$rest" | cut -d' ' -f1)
+                why=$(printf '%s' "$rest" | cut -d' ' -f2-)
+                case "$secs" in ''|*[!0-9]*) secs="$interval" ;; esac
+                echo "[$(date '+%H:%M:%S')] ${why}，${secs}s 后再查"
+                watch_notify "kimi-switch 额度预警" "$why"
+                [ "$once" -eq 1 ] && return 3
+                sleep "$secs"
+                continue
+                ;;
+            *)
+                echo "[$(date '+%H:%M:%S')] 检查失败（网络问题？），下个周期重试" >&2
+                [ "$once" -eq 1 ] && return 1
+                ;;
+        esac
+        sleep "$interval"
+    done
 }
 
 cmd_auto() {
@@ -909,6 +1157,8 @@ kimi-switch — 一键切换 Kimi Code CLI 账号
   kimi-switch prefs        查看/修改启动偏好（prefs model|permission|effort 值）
   kimi-switch usage        查看所有账号的用量（5小时窗口 / 每周额度 / 加油包）
   kimi-switch rotate       无交互切到有额度的最佳其他账号，不启动 kimi
+  kimi-switch best [-v]    按平衡策略选出的账号（-v 显示各账号评分明细）
+  kimi-switch watch        5h 预判守护：快用超前自动热切（--once 单次，给 launchd/cron）
   kimi-switch synclive     把 live 里 CLI 刷新过的最新凭证回同步到当前账号快照（usage/use 已自动做）
   kimi-switch ls           列出所有账号（含昵称），* 号 = 当前生效
   kimi-switch current      只显示当前账号名
@@ -928,6 +1178,19 @@ kimi-switch — 一键切换 Kimi Code CLI 账号
   没有可用备用账号时保持当前账号不变，并返回退出码 3。
   自动化程序应仅在 QUOTA_EXCEEDED_ERR 或 QuotaExceededError 后调用 rotate。
 
+【自动平衡策略（best / go / rotate / watch 共用）】
+  优先级：5h 可用（门槛，默认剩 10%）> 周重置紧迫度 > 5h 余量 > 周余量。
+  紧迫度 = 周剩余占比 − 本周期剩余时间占比：谁快重置且剩得多就先用谁，
+  谁也不欠谁的节奏就退化为"谁剩得多用谁"。当前账号与最优者同档时保持不动。
+  用 kimi-switch best -v 可查看每个账号的评分明细。
+
+【5h 预判热切（watch）】
+  kimi-switch watch 常驻检查（默认每 180s）：当前账号 5h 剩余跌破阈值
+  （threshold 偏好，默认 10%），或按最近两次采样的消耗速率预测下次检查前
+  会跌破，就立即按平衡策略热切到最佳账号并弹系统通知——在用超之前切走。
+  所有账号都不足时睡到最早的 5h 恢复点再查。--once 单次检查，配合
+  launchd/cron 定时执行；无可切账号时返回退出码 3（同 rotate）。
+
 【注意】
   · 切换对运行中的 kimi 会话即时生效（CLI 每次请求都重读凭证文件），无需重启
   · 状态栏用量来自本地缓存，由 usage / go 命令刷新
@@ -944,6 +1207,8 @@ case "${1:-}" in
     dir)     cmd_dir "${2:-last}" ;;
     prefs)   shift; cmd_prefs "$@" ;;
     rotate)  cmd_rotate ;;
+    best)    cmd_best "${2:-}" ;;
+    watch)   shift; cmd_watch "$@" ;;
     ls)      cmd_ls ;;
     current) cmd_current ;;
     rm)      [ -n "${2:-}" ] || { echo "用法: kimi-switch rm <名字>"; exit 1; }; cmd_rm "$2" ;;
@@ -951,5 +1216,5 @@ case "${1:-}" in
     usage|status) cmd_usage ;;
     statusline) cat "$PROFILES/.statusline.txt" 2>/dev/null || ks_py statusline "$PROFILES" "$CRED" "$CACHE" ;;
     "")      cmd_auto ;;
-    *)       echo "未知命令「$1」。可用：save / use / rotate / go / prefs / usage / synclive / ls / current / rm / statusline，或不带参数一键切换"; exit 1 ;;
+    *)       echo "未知命令「$1」。可用：save / use / rotate / best / watch / go / prefs / usage / synclive / ls / current / rm / statusline，或不带参数一键切换"; exit 1 ;;
 esac
