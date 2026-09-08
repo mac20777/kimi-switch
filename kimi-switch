@@ -34,10 +34,11 @@ mkdir -p "$PROFILES"
 chmod 700 "$PROFILES"
 
 # 偏好文件：每次 go 启动前套用到 config.toml，解决 CLI 每次打开都要重选的问题
+# permission=auto 即新版 Never Ask：全程不确认直接执行（yolo 仍会对危险命令/敏感文件/退 Plan 确认）
 if [ ! -f "$PREFS" ]; then
     cat > "$PREFS" <<'EOF'
 model=kimi-code/k3
-permission=yolo
+permission=auto
 effort=max
 EOF
 fi
@@ -902,7 +903,8 @@ cmd_prefs() {
         echo "平衡策略参数：threshold=$(pref_val threshold 10)（5h 剩余百分比阈值），interval=$(pref_val interval 180)（watch 检查间隔秒）"
         echo
         echo "修改示例：kimi-switch prefs model kimi-code/k3"
-        echo "          kimi-switch prefs permission yolo|auto|manual"
+        echo "          kimi-switch prefs permission auto|yolo|manual"
+        echo "            （auto=全程不确认直接执行；yolo=常规自动，危险命令/敏感文件仍确认；manual=每步确认）"
         echo "          kimi-switch prefs effort low|high|max"
         echo "          kimi-switch prefs threshold 10"
         echo "          kimi-switch prefs interval 180"
