@@ -7,7 +7,7 @@
 # 运行中的会话下一次请求即生效——切换是热切换，无需重启会话。
 #
 # 用法：
-#   kimi-switch               只有两个账号时直接互换；否则弹出编号菜单
+#   kimi-switch               两账号直接互换（目标周额度已用尽会拒绝）；多账号弹编号菜单
 #   kimi-switch save <名字>   把当前登录态存为账号快照（先 /login 再 save）
 #   kimi-switch use <名字>    切换到指定账号
 #   kimi-switch rotate       无交互切到有额度的最佳其他账号
@@ -187,13 +187,14 @@ def fmt_reset(iso):
     return t.strftime('%H:%M') if t.date() == now.date() else t.strftime('%m-%d %H:%M')
 
 def used_of(d):
+    # used 真的未知时返回 None 而不是 0：当成 0 会让耗尽账号看起来满血，选号时被误选
     if not d:
         return None, None
     limit = d.get('limit')
     used = d.get('used')
     if used is None and d.get('remaining') is not None and limit is not None:
         used = int(limit) - int(d['remaining'])
-    return (int(used) if used is not None else 0), (int(limit) if limit is not None else None)
+    return (int(used) if used is not None else None), (int(limit) if limit is not None else None)
 
 def window_label(win):
     dur, unit = (win or {}).get('duration'), (win or {}).get('timeUnit', '')
@@ -231,15 +232,16 @@ def query_account(path):
 def cache_entry(data):
     entry = {'ts': int(time.time())}
     w_used, w_limit = used_of(data.get('usage'))
-    if w_limit is not None:
+    if w_used is not None and w_limit is not None:
         entry['week_used'], entry['week_limit'] = w_used, w_limit
         entry['week_reset'] = (data.get('usage') or {}).get('resetTime', '')
     for row in data.get('limits') or []:
         win = row.get('window') or {}
         if win.get('timeUnit') == 'TIME_UNIT_MINUTE' and win.get('duration') == 300:
             u, l = used_of(row.get('detail'))
-            entry['h5_used'], entry['h5_limit'] = u, l
-            entry['h5_reset'] = (row.get('detail') or {}).get('resetTime', '')
+            if u is not None and l is not None:
+                entry['h5_used'], entry['h5_limit'] = u, l
+                entry['h5_reset'] = (row.get('detail') or {}).get('resetTime', '')
     return entry
 
 def reset_ts(iso):
@@ -267,20 +269,25 @@ def quotas(data):
 def balance_key(data, now):
     """平衡排序键：(surplus 档位, 5h剩余, 周剩余, surplus 原值)。大的优先。
     surplus = 周剩余占比 − 本周期剩余时间占比：越大说明照当前节奏重置前用不完，越要先用
-    （“谁快重置且剩得多，先用谁”）。档位按 5 个百分点取整，同档由 5h 剩余裁决。"""
+    （“谁快重置且剩得多，先用谁”）。档位按 5 个百分点取整，同档由 5h 剩余裁决。
+    周数据缺失的账号档位压到 -1000：是否已耗尽无从得知，永远排在周健康账号之后。"""
     q = quotas(data)
-    h5_rem = (q['h5_limit'] - q['h5_used']) if q['h5_limit'] is not None else -1
-    w_rem = (q['week_limit'] - q['week_used']) if q['week_limit'] is not None else -1
+    h5_known = q['h5_limit'] is not None and q['h5_used'] is not None
+    w_known = q['week_limit'] is not None and q['week_used'] is not None
+    h5_rem = (q['h5_limit'] - q['h5_used']) if h5_known else -1
+    w_rem = (q['week_limit'] - q['week_used']) if w_known else -1
     surplus = 0.0
-    if q['week_limit'] and q['week_reset']:
+    if w_known and q['week_limit'] and q['week_reset']:
         time_frac = min(1.0, max(0.0, q['week_reset'] - now) / WEEK_SECONDS)
         surplus = w_rem / q['week_limit'] - time_frac
     bucket = int(round(surplus / 0.05))
+    if not w_known:
+        bucket -= 1000
     return (bucket, h5_rem, w_rem, surplus)
 
 def rank_accounts(now, min_h5_pct, exclude=None):
     """查询所有账号并按平衡策略排序。返回 (candidates, skipped, h5_resets)：
-    candidates 已过不可用的硬门槛（周剩余>0、5h 剩余>min_h5_pct%），按优先级降序；
+    candidates 已过不可用的硬门槛（周已知用尽排除、5h 剩余>min_h5_pct%），按优先级降序；
     skipped 是被排除的 [(name, key|None, quotas|None, 原因)]；
     h5_resets 是所有查询成功账号的 5h 重置时间戳（watch 的 WAIT 用）。"""
     cands, skipped, resets = [], [], []
@@ -298,11 +305,13 @@ def rank_accounts(now, min_h5_pct, exclude=None):
         if q['h5_reset']:
             resets.append(q['h5_reset'])
         key = balance_key(data, now)
-        h5_rem, w_rem = key[1], key[2]
-        if w_rem == 0:
+        h5_rem = key[1]
+        # 周用尽含超限（used>limit 时剩余为负，一样发不出请求）；周数据缺失不硬排，靠排序降权
+        if q['week_limit'] is not None and q['week_used'] is not None \
+                and q['week_limit'] - q['week_used'] <= 0:
             skipped.append((name, key, q, '周额度已用尽'))
             continue
-        if q['h5_limit'] is None:
+        if q['h5_limit'] is None or q['h5_used'] is None:
             skipped.append((name, key, q, '5h 数据缺失'))
             continue
         if h5_rem <= q['h5_limit'] * min_h5_pct / 100.0:
@@ -327,8 +336,8 @@ def print_score_row(name, key, q, note, current, now):
     if key is None or q is None:
         print('%-14s %-10s %-10s %-10s %-7s %s' % (label, '?', '?', '?', '?', note))
         return
-    h5 = '%d/%d' % (key[1], q['h5_limit']) if q['h5_limit'] is not None else '?'
-    wk = '%d/%d' % (key[2], q['week_limit']) if q['week_limit'] is not None else '?'
+    h5 = '%d/%d' % (key[1], q['h5_limit']) if q['h5_limit'] is not None and q['h5_used'] is not None else '?'
+    wk = '%d/%d' % (key[2], q['week_limit']) if q['week_limit'] is not None and q['week_used'] is not None else '?'
     rst = fmt_duration(q['week_reset'] - now) if q['week_reset'] else '?'
     print('%-14s %-10s %-10s %-10s %-7s %s' % (label, h5, wk, rst, '%+.2f' % key[3], note))
 
@@ -502,11 +511,15 @@ elif cmd == 'usage':
 
         weekly, wlimit = used_of(data.get('usage'))
         if wlimit is not None:
-            print('  每周额度：%s/%s，%s 重置' % (weekly, wlimit, fmt_reset((data.get('usage') or {}).get('resetTime'))))
+            wused = str(weekly) if weekly is not None else '?'
+            print('  每周额度：%s/%s，%s 重置' % (wused, wlimit, fmt_reset((data.get('usage') or {}).get('resetTime'))))
 
         for row in data.get('limits') or []:
             used, limit = used_of(row.get('detail'))
-            print('  %s：%s/%s，%s 重置' % (window_label(row.get('window')), used, limit, fmt_reset((row.get('detail') or {}).get('resetTime'))))
+            print('  %s：%s/%s，%s 重置' % (window_label(row.get('window')),
+                                          used if used is not None else '?',
+                                          limit if limit is not None else '?',
+                                          fmt_reset((row.get('detail') or {}).get('resetTime'))))
 
         wallet = data.get('boosterWallet')
         if wallet:
@@ -520,8 +533,8 @@ elif cmd == 'usage':
 
 elif cmd == 'best':
     # argv: best <profiles_dir> <live_cred> <cache> [min_h5_pct] [--verbose]
-    # 平衡策略选号：硬门槛（周剩余>0、5h 剩余>min_h5_pct%）→ 节奏盈余档位 → 5h 剩余 → 周剩余。
-    # 迟滞：当前账号与第一名同档（surplus 差 <5pp）时保持不动。全部不过门槛时回退到余量最大者。
+    # 平衡策略选号：硬门槛（周已知用尽排除、5h 剩余>min_h5_pct%）→ 节奏盈余档位 → 5h 剩余 → 周剩余。
+    # 迟滞：当前账号与第一名同档（surplus 差 <5pp）时保持不动。全部不过门槛时回退（周活账号优先）。
     extra = sys.argv[5:]
     verbose = '--verbose' in extra
     nums = [a for a in extra if a != '--verbose']
@@ -532,8 +545,15 @@ elif cmd == 'best':
     cands, skipped, _ = rank_accounts(now, min_h5_pct)
     fallback = False
     if not cands:
+        # 回退也优先周额度活着的号：周用尽要熬到重置，5h 见底只等几小时。
+        # 分层：周有剩(1) > 周未知(0) > 周用尽(-1)，同层再按平衡键排序
         pool = [(n, k, q, None) for (n, k, q, _) in skipped if k is not None]
-        pool.sort(key=lambda r: r[1], reverse=True)
+        def week_tier(r):
+            wq = r[2]
+            if wq is None or wq['week_limit'] is None or wq['week_used'] is None:
+                return 0
+            return 1 if wq['week_limit'] - wq['week_used'] > 0 else -1
+        pool.sort(key=lambda r: (week_tier(r), r[1]), reverse=True)
         cands, fallback = pool[:1], True
     chosen = cands[0][0] if cands else None
     kept = False
@@ -546,7 +566,7 @@ elif cmd == 'best':
         for n, k, q, _ in cands:
             note = ''
             if n == chosen:
-                note = '← 选用' + ('（与最优同档，保持当前）' if kept else '') + ('（全员未过门槛，回退取余量最大）' if fallback else '')
+                note = '← 选用' + ('（与最优同档，保持当前）' if kept else '') + ('（全员未过门槛，回退优先周活账号）' if fallback else '')
             print_score_row(n, k, q, note, current, now)
         for n, k, q, why in skipped:
             if n != chosen:
@@ -563,6 +583,20 @@ elif cmd == 'best-other':
     cands, _, _ = rank_accounts(time.time(), min_h5_pct, exclude=current_profile_name())
     write_statusline_file(statusline_text())
     print(cands[0][0] if cands else '')
+
+elif cmd == 'weekcheck':
+    # argv: weekcheck <profiles_dir> <live_cred> <cache> <name>
+    # 裸命令盲换前查目标账号周额度。退出码：0=正常或未知（放行）；4=已知用尽含超限（拦截）；1=查询失败（放行）
+    name = sys.argv[5]
+    try:
+        _, data = query_account(os.path.join(profiles_dir, name + '.credentials.json'))
+    except Exception:
+        sys.exit(1)
+    update_cache(name, cache_entry(data))
+    q = quotas(data)
+    if q['week_limit'] is not None and q['week_used'] is not None and q['week_limit'] - q['week_used'] <= 0:
+        sys.exit(4)
+    sys.exit(0)
 
 elif cmd == 'watchcheck':
     # argv: watchcheck <profiles_dir> <live_cred> <cache> [threshold_pct] [interval_sec]
@@ -584,8 +618,10 @@ elif cmd == 'watchcheck':
     update_cache(cur, cache_entry(data))
     write_statusline_file(statusline_text())
     q = quotas(data)
-    h5_rem = (q['h5_limit'] - q['h5_used']) if q['h5_limit'] is not None else -1
-    w_rem = (q['week_limit'] - q['week_used']) if q['week_limit'] is not None else -1
+    h5_known = q['h5_limit'] is not None and q['h5_used'] is not None
+    w_known = q['week_limit'] is not None and q['week_used'] is not None
+    h5_rem = (q['h5_limit'] - q['h5_used']) if h5_known else -1
+    w_rem = (q['week_limit'] - q['week_used']) if w_known else None
     # 采样落盘，用相邻两次的差值推算消耗速率，预测下次检查前会不会跌破阈值
     state_path = os.path.join(profiles_dir, '.watch-state.json')
     try:
@@ -594,22 +630,22 @@ elif cmd == 'watchcheck':
         prev = None
     save_json(state_path, {'name': cur, 'ts': int(now), 'h5_used': q['h5_used']})
     projected = None
-    if prev and prev.get('name') == cur and q['h5_used'] is not None and prev.get('h5_used') is not None:
+    if prev and prev.get('name') == cur and h5_known and prev.get('h5_used') is not None:
         dt = now - prev['ts']
         if dt > 0:
             rate = (q['h5_used'] - prev['h5_used']) / dt
             if rate > 0:
                 projected = h5_rem - rate * interval
     reason = None
-    if w_rem == 0:
+    if w_rem is not None and w_rem <= 0:
         reason = '周额度已用尽'
-    elif q['h5_limit'] and h5_rem <= q['h5_limit'] * threshold / 100.0:
+    elif h5_known and h5_rem <= q['h5_limit'] * threshold / 100.0:
         reason = '5h 剩 %d/%d，跌破 %d%% 阈值' % (h5_rem, q['h5_limit'], threshold)
-    elif projected is not None and q['h5_limit'] and projected <= q['h5_limit'] * threshold / 100.0:
+    elif projected is not None and projected <= q['h5_limit'] * threshold / 100.0:
         reason = '按当前消耗速率，下次检查前 5h 将跌破 %d%% 阈值' % threshold
     if not reason:
-        h5s = '%d/%d' % (h5_rem, q['h5_limit']) if q['h5_limit'] is not None else '未知'
-        ws = '%d/%d' % (w_rem, q['week_limit']) if q['week_limit'] is not None else '未知'
+        h5s = '%d/%d' % (h5_rem, q['h5_limit']) if h5_known else '未知'
+        ws = '%d/%d' % (w_rem, q['week_limit']) if w_known else '未知'
         print('STAY 当前「%s」余量健康（5h剩%s · 周剩%s）' % (cur, h5s, ws))
         sys.exit(0)
     cands, _, resets = rank_accounts(now, threshold, exclude=cur)
@@ -1119,6 +1155,14 @@ cmd_auto() {
         if [ -z "$other" ]; then
             other="${names[0]}"
         fi
+        # 盲换前查目标周额度：已知用尽（含超限）的号换了也发不出请求；查询失败不挡手动切换
+        local rc=0
+        ks_py weekcheck "$PROFILES" "$CRED" "$CACHE" "$other" 2>/dev/null || rc=$?
+        if [ "$rc" -eq 4 ]; then
+            echo "「${other}」的周额度已用尽，换过去也用不成，已取消"
+            echo "  查看用量：kimi-switch usage    强制切换：kimi-switch use ${other}"
+            exit 1
+        fi
         cmd_use "$other"
     else
         echo "选择要切换的账号："
@@ -1151,7 +1195,7 @@ kimi-switch — 一键切换 Kimi Code CLI 账号
   （名字随便起，中文也行，比如 kimi-switch save 主号）
 
 【日常使用】
-  kimi-switch              一键互换（只存了两个账号时最常用）
+  kimi-switch              一键互换（两个账号时；目标周额度已用尽会拒绝，use 可强制）
   kimi-switch go           自动选号 + 套用偏好并启动 kimi（当前目录开新会话）
   kimi-switch go <编号>    跳回最近项目并接着上次的对话聊（last = 上一个项目）
   kimi-switch dirs         最近项目列表，附各项目上次的会话标题和时间
@@ -1181,7 +1225,10 @@ kimi-switch — 一键切换 Kimi Code CLI 账号
   自动化程序应仅在 QUOTA_EXCEEDED_ERR 或 QuotaExceededError 后调用 rotate。
 
 【自动平衡策略（best / go / rotate / watch 共用）】
-  优先级：5h 可用（门槛，默认剩 10%）> 周重置紧迫度 > 5h 余量 > 周余量。
+  优先级：周额度可用（硬门槛，已知用尽一律排除，超限也算用尽）
+  > 5h 可用（门槛，默认剩 10%）> 周重置紧迫度 > 5h 余量 > 周余量。
+  周数据缺失的账号无法确认是否已耗尽，排在所有周健康账号之后；
+  全员不过门槛时，回退优先选周额度还活着的账号。
   紧迫度 = 周剩余占比 − 本周期剩余时间占比：谁快重置且剩得多就先用谁，
   谁也不欠谁的节奏就退化为"谁剩得多用谁"。当前账号与最优者同档时保持不动。
   用 kimi-switch best -v 可查看每个账号的评分明细。

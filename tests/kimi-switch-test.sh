@@ -144,4 +144,62 @@ out=$(KIMI_CODE_HOME="$kimi_home" KS_USAGE_FIXTURES="$fixtures" "$repo_root/kimi
 printf '%s' "$out" | grep -q '余量健康'
 cmp -s "$kimi_home/credentials/kimi-code.json" "$kimi_home/accounts/B.credentials.json"
 
+# 场景 7：周超限（used>limit）同样算用尽——A 当前周剩 50，B 周 120/100 但 5h 满 → best 仍选 A
+cp "$kimi_home/accounts/A.credentials.json" "$kimi_home/credentials/kimi-code.json"
+printf 'A' > "$kimi_home/accounts/.current"
+make_fixture A 10 100 50 100 18000 345600
+make_fixture B 0 100 120 100 18000 345600
+pick=$(KIMI_CODE_HOME="$kimi_home" KS_USAGE_FIXTURES="$fixtures" "$repo_root/kimi-switch" best)
+[[ "$pick" == "A" ]] || { echo "week-overdraft case: expected A, got $pick" >&2; exit 1; }
+
+# 场景 8：rotate 不往周超限号上切——A 当前 5h 打满，B 周超限 → 退出码 3，保持 A
+make_fixture A 100 100 50 100 18000 345600
+rc=0
+KIMI_CODE_HOME="$kimi_home" KS_USAGE_FIXTURES="$fixtures" "$repo_root/kimi-switch" rotate >/dev/null 2>&1 || rc=$?
+[[ "$rc" -eq 3 ]] || { echo "rotate overdraft case: expected exit 3, got $rc" >&2; exit 1; }
+[[ "$(<"$kimi_home/accounts/.current")" == "A" ]]
+cmp -s "$kimi_home/credentials/kimi-code.json" "$kimi_home/accounts/A.credentials.json"
+
+# 场景 9：best 回退优先周活号——A 当前 5h 打满（周剩 50），B 周用尽但 2h 后重置、5h 满 → 选 A
+make_fixture B 0 100 100 100 18000 7200
+pick=$(KIMI_CODE_HOME="$kimi_home" KS_USAGE_FIXTURES="$fixtures" "$repo_root/kimi-switch" best)
+[[ "$pick" == "A" ]] || { echo "fallback week-alive case: expected A, got $pick" >&2; exit 1; }
+
+# 场景 10：周数据缺失降权——B 的 usage 为 null、5h 满 → best 仍选周健康的 A
+make_fixture A 10 100 50 100 18000 345600
+python3 - "$fixtures/B.usage.json" <<'FIXEOF'
+import json, sys, time
+from datetime import datetime, timezone
+iso = lambda s: datetime.fromtimestamp(time.time() + s, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+json.dump({'usage': None,
+           'limits': [{'window': {'duration': 300, 'timeUnit': 'TIME_UNIT_MINUTE'},
+                       'detail': {'used': 0, 'limit': 100, 'resetTime': iso(18000)}}]},
+          open(sys.argv[1], 'w'))
+FIXEOF
+pick=$(KIMI_CODE_HOME="$kimi_home" KS_USAGE_FIXTURES="$fixtures" "$repo_root/kimi-switch" best)
+[[ "$pick" == "A" ]] || { echo "week-unknown case: expected A, got $pick" >&2; exit 1; }
+
+# 场景 11：watch --once 当前号周超限（120/100）、5h 健康 → 仍判定周用尽，切到 B
+rm -f "$kimi_home/accounts/.watch-state.json"
+make_fixture A 10 100 120 100 18000 345600
+make_fixture B 10 100 50 100 18000 345600
+KIMI_CODE_HOME="$kimi_home" KS_USAGE_FIXTURES="$fixtures" "$repo_root/kimi-switch" watch --once >/dev/null
+cmp -s "$kimi_home/credentials/kimi-code.json" "$kimi_home/accounts/B.credentials.json"
+[[ "$(<"$kimi_home/accounts/.current")" == "B" ]]
+
+# 场景 12：裸命令盲换拦截周用尽目标——当前 A，B 周用尽 → 退出 1 且保持 A；B 恢复后正常互换
+cp "$kimi_home/accounts/A.credentials.json" "$kimi_home/credentials/kimi-code.json"
+printf 'A' > "$kimi_home/accounts/.current"
+make_fixture A 10 100 50 100 18000 345600
+make_fixture B 10 100 100 100 18000 345600
+rc=0
+KIMI_CODE_HOME="$kimi_home" KS_USAGE_FIXTURES="$fixtures" "$repo_root/kimi-switch" >/dev/null 2>&1 || rc=$?
+[[ "$rc" -eq 1 ]] || { echo "blind-swap block case: expected exit 1, got $rc" >&2; exit 1; }
+[[ "$(<"$kimi_home/accounts/.current")" == "A" ]]
+cmp -s "$kimi_home/credentials/kimi-code.json" "$kimi_home/accounts/A.credentials.json"
+make_fixture B 10 100 50 100 18000 345600
+KIMI_CODE_HOME="$kimi_home" KS_USAGE_FIXTURES="$fixtures" "$repo_root/kimi-switch" >/dev/null
+[[ "$(<"$kimi_home/accounts/.current")" == "B" ]]
+cmp -s "$kimi_home/credentials/kimi-code.json" "$kimi_home/accounts/B.credentials.json"
+
 echo "kimi-switch-test: PASS"
